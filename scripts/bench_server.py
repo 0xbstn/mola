@@ -103,6 +103,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-models", default=None)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--routed-validation",
+        action="store_true",
+        help="Run the focused routed decode validation scenario set and require routed_decode_reference_enabled=true",
+    )
+    parser.add_argument(
         "--require-routed-decode-reference",
         action="store_true",
         help="Fail fast unless /v1/engine/metrics reports routed_decode_reference_enabled=true",
@@ -431,6 +436,32 @@ def _build_scenarios(
     return scenarios
 
 
+def _build_routed_validation_scenarios(
+    *,
+    same_model: str,
+    mixed_models: list[str],
+    adapter_names: list[str],
+    base_model_path: str,
+    max_tokens: int,
+    long_decode_tokens: int,
+) -> list[ScenarioSpec]:
+    return [
+        ScenarioSpec("same", [same_model], max_tokens=max_tokens),
+        ScenarioSpec("mixed", mixed_models, max_tokens=max_tokens),
+        ScenarioSpec(
+            "long-decode-mixed",
+            mixed_models,
+            prompt_mode="long_decode",
+            max_tokens=max(max_tokens, long_decode_tokens),
+        ),
+        ScenarioSpec(
+            "fairness",
+            _build_fairness_models(adapter_names, same_model, base_model_path),
+            max_tokens=max_tokens,
+        ),
+    ]
+
+
 def _print_header(
     base_url: str,
     health: dict,
@@ -479,11 +510,14 @@ def _default_output_path(version: str) -> Path:
 async def main():
     args = _parse_args()
     concurrency_levels = _parse_concurrency(args.concurrency)
+    require_routed_decode_reference = (
+        args.require_routed_decode_reference or args.routed_validation
+    )
 
     async with httpx.AsyncClient(timeout=args.timeout) as client:
         health = await _get_json(client, f"{args.base_url}/health")
         engine_metrics = await _get_json(client, f"{args.base_url}/v1/engine/metrics")
-        if args.require_routed_decode_reference and not engine_metrics.get(
+        if require_routed_decode_reference and not engine_metrics.get(
             "routed_decode_reference_enabled", False
         ):
             raise SystemExit(
@@ -501,15 +535,26 @@ async def main():
             args.mixed_models,
             same_model,
         )
-        scenarios = _build_scenarios(
-            adapter_names=adapter_names,
-            base_model_path=health["model"],
-            same_model=same_model,
-            mixed_models=mixed_models,
-            max_tokens=args.max_tokens,
-            extended=args.extended,
-            long_prefill_tokens=args.long_prefill_tokens,
-            long_decode_tokens=args.long_decode_tokens,
+        scenarios = (
+            _build_routed_validation_scenarios(
+                same_model=same_model,
+                mixed_models=mixed_models,
+                adapter_names=adapter_names,
+                base_model_path=health["model"],
+                max_tokens=args.max_tokens,
+                long_decode_tokens=args.long_decode_tokens,
+            )
+            if args.routed_validation
+            else _build_scenarios(
+                adapter_names=adapter_names,
+                base_model_path=health["model"],
+                same_model=same_model,
+                mixed_models=mixed_models,
+                max_tokens=args.max_tokens,
+                extended=args.extended,
+                long_prefill_tokens=args.long_prefill_tokens,
+                long_decode_tokens=args.long_decode_tokens,
+            )
         )
 
         _print_header(args.base_url, health, adapters, scenarios, engine_metrics)
