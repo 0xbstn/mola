@@ -6,6 +6,7 @@ import asyncio
 import queue
 import threading
 import time
+from collections import deque
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,14 +17,18 @@ from mola.engine import (
     EngineMetrics,
     GenerateRequest,
     MOLAEngine,
+    RuntimeSlotLayout,
     _AdapterSlot,
     _get_stop_tokens,
 )
+from mola.adapter import AdapterSlotBinding
 
 
 def _make_engine(**overrides):
     mola_model = MagicMock()
     mola_model.tokenizer.eos_token_id = 0
+    mola_model.adapter_slot_id.return_value = None
+    mola_model.adapter_slot_bindings.return_value = []
     config = overrides.pop("config", None)
     generator_factory = overrides.pop("generator_factory", None)
     return MOLAEngine(mola_model, config, generator_factory=generator_factory)
@@ -34,6 +39,8 @@ class TestEngineMetrics:
         m = EngineMetrics()
         snap = m.snapshot()
         assert snap["queued_requests"] == 0
+        assert snap["total_step_lock_wait_ms"] == 0
+        assert snap["total_insert_lock_wait_ms"] == 0
         assert snap["avg_ttft_ms"] == 0
         assert snap["avg_tps"] == 0
 
@@ -167,6 +174,159 @@ class TestIdleCleanup:
         mock_gen.close.assert_not_called()
 
 
+class TestAdapterSlotResolution:
+    class _FakeLayer:
+        def __init__(self, bindings):
+            self._bindings = bindings
+
+        @property
+        def slot_ids(self):
+            return tuple(slot_id for slot_id, *_ in self._bindings)
+
+        def slot_bindings(self):
+            return list(self._bindings)
+
+    def test_slot_id_uses_model_resolver(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_id.return_value = 7
+        assert engine._adapter_slot_id("rust") == 7
+
+    def test_slot_id_rejects_non_int_mock_values(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_id.return_value = MagicMock()
+        assert engine._adapter_slot_id("rust") is None
+
+    def test_runtime_slot_layout_tracks_loaded_active_and_pending_slots(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            MagicMock(slot_id=1),
+            MagicMock(slot_id=2),
+            MagicMock(slot_id=3),
+        ]
+
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={10})
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql")
+        sql_slot.pending_requests.append(GenerateRequest([1], "sql", 10, None, asyncio.Queue()))
+        engine._generators = {"rust": rust_slot, "sql": sql_slot, None: _AdapterSlot(generator=MagicMock(), adapter_id=None, active_uids={1})}
+
+        def slot_id(adapter_id):
+            return {"rust": 1, "sql": 2}.get(adapter_id)
+
+        engine.mola_model.adapter_slot_id.side_effect = slot_id
+
+        assert engine.runtime_slot_layout() == RuntimeSlotLayout(
+            loaded_slot_ids=(1, 2, 3),
+            active_slot_ids=(1,),
+            pending_slot_ids=(2,),
+        )
+
+    def test_active_slot_bindings_filters_loaded_bindings_by_runtime_state(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+            AdapterSlotBinding("legal", 3, 8, 16.0, 1, ("q_proj",), "/fake/legal"),
+        ]
+
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={10})
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql")
+        sql_slot.pending_requests.append(GenerateRequest([1], "sql", 10, None, asyncio.Queue()))
+        engine._generators = {"rust": rust_slot, "sql": sql_slot}
+
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        assert engine.active_slot_bindings() == (
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+        )
+
+    def test_active_slot_bindings_are_sorted(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+        ]
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {
+            "sql": 2,
+            "rust": 1,
+        }.get(adapter_id)
+        engine._generators["sql"] = _AdapterSlot(
+            generator=MagicMock(),
+            adapter_id="sql",
+            pending_requests=deque([GenerateRequest([1], "sql", 8, None, asyncio.Queue())]),
+        )
+        engine._generators["rust"] = _AdapterSlot(
+            generator=MagicMock(),
+            adapter_id="rust",
+            active_uids={1, 2},
+        )
+
+        assert engine.active_slot_bindings() == (
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+        )
+
+    def test_layer_slot_pack_views_builds_from_runtime_and_model(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+            AdapterSlotBinding("legal", 3, 8, 16.0, 1, ("q_proj",), "/fake/legal"),
+        ]
+        engine.mola_model.iter_slot_bound_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (3, "a-legal", "b-legal", 16.0),
+                    (1, "a-rust", "b-rust", 16.0),
+                    (2, "a-sql", "b-sql", 16.0),
+                ]),
+            ),
+        ])
+
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={10})
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql")
+        sql_slot.pending_requests.append(GenerateRequest([1], "sql", 10, None, asyncio.Queue()))
+        engine._generators = {"rust": rust_slot, "sql": sql_slot}
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        views = engine.layer_slot_pack_views()
+
+        assert len(views) == 1
+        assert views[0].layer_name == "layers.0.q_proj"
+        assert views[0].slot_ids == (1, 2)
+        assert tuple(entry.adapter_name for entry in views[0].entries) == ("rust", "sql")
+
+    def test_materialize_layer_slot_packs_uses_runtime_state(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+        ]
+        engine.mola_model.iter_slot_bound_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (2, "a-sql", "b-sql", 20.0),
+                    (1, "a-rust", "b-rust", 16.0),
+                ]),
+            ),
+        ])
+        engine._generators = {
+            "rust": _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1}),
+            "sql": _AdapterSlot(generator=MagicMock(), adapter_id="sql", pending_requests=deque([GenerateRequest([1], "sql", 10, None, asyncio.Queue())])),
+        }
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        packs = engine.materialize_layer_slot_packs(stack_fn=lambda values: tuple(values))
+
+        assert len(packs) == 1
+        assert packs[0].layer_name == "layers.0.q_proj"
+        assert packs[0].slot_ids == (1, 2)
+        assert packs[0].adapter_names == ("rust", "sql")
+        assert packs[0].lora_a == ("a-rust", "a-sql")
+
+
 class TestModelLock:
     def test_is_threading_lock(self):
         engine = _make_engine()
@@ -239,6 +399,63 @@ class TestPendingTracking:
         assert ("rust", 0) in engine._uid_to_request
         assert ("rust", 1) in engine._uid_to_request
         mock_gen.submit_batch.assert_called_once()
+
+    def test_insert_pending_records_insert_metrics(self):
+        engine = _make_engine(config=EngineConfig(prefill_batch_size=1))
+        q = asyncio.Queue()
+        req = GenerateRequest([1], "rust", 10, None, q)
+        mock_gen = MagicMock()
+        mock_gen.submit_batch.return_value = [MagicMock(uid=0)]
+        slot = _AdapterSlot(generator=mock_gen, adapter_id="rust")
+        slot.pending_requests.append(req)
+        engine._generators["rust"] = slot
+
+        inserted = engine._insert_pending(slot)
+
+        assert inserted is True
+        snap = slot.slot_metrics.snapshot()
+        assert snap["insert_calls"] == 1
+        assert snap["inserted_requests"] == 1
+        assert snap["avg_insert_ms"] >= 0
+        assert snap["avg_insert_lock_wait_ms"] >= 0
+
+
+class TestProfilingMetrics:
+    def test_slot_snapshot_includes_lock_wait_metrics(self):
+        engine = _make_engine()
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust")
+        slot.slot_metrics.record_insert(9.5, 1.5, 2)
+        slot.slot_metrics.record_step(4.0, 0.5, 3)
+        engine._generators["rust"] = slot
+
+        snap = engine.slot_snapshots()["rust"]
+
+        assert snap["insert_calls"] == 1
+        assert snap["inserted_requests"] == 2
+        assert snap["avg_insert_lock_wait_ms"] == pytest.approx(1.5, abs=0.01)
+        assert snap["avg_step_lock_wait_ms"] == pytest.approx(0.5, abs=0.01)
+
+    def test_step_slot_records_lock_wait_metrics(self):
+        engine = _make_engine()
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        engine._uid_to_request[("rust", 0)] = req
+        engine._send_to_queue = lambda *_args, **_kwargs: True
+
+        response = MagicMock()
+        response.handle.uid = 0
+        response.token = 7
+        response.finish_reason = None
+
+        mock_gen = MagicMock()
+        mock_gen.step.return_value = [response]
+        slot = _AdapterSlot(generator=mock_gen, adapter_id="rust", active_uids={0})
+
+        engine._step_slot(slot)
+
+        snap = slot.slot_metrics.snapshot()
+        assert snap["steps"] == 1
+        assert snap["avg_step_lock_wait_ms"] >= 0
+        assert engine.metrics.snapshot()["total_step_lock_wait_ms"] >= 0
 
 
 class TestUidNamespacing:

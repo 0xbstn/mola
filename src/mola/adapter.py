@@ -11,12 +11,11 @@ Adapter format (standard PEFT/mlx-lm):
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +66,20 @@ class AdapterWeights:
 @dataclass
 class Adapter:
     name: str
+    slot_id: int | None
     config: AdapterConfig
     weights: AdapterWeights
+    source_path: str
+
+
+@dataclass(frozen=True)
+class AdapterSlotBinding:
+    name: str
+    slot_id: int
+    rank: int
+    scale: float
+    num_layers: int
+    target_modules: tuple[str, ...]
     source_path: str
 
 
@@ -82,6 +93,21 @@ class AdapterManager:
     def __init__(self, max_adapters: int = 50):
         self.adapters: dict[str, Adapter] = {}
         self.max_adapters = max_adapters
+        self._free_slot_ids: list[int] = []
+        self._next_slot_id = 0
+        self._slot_to_name: dict[int, str] = {}
+
+    def _allocate_slot_id(self) -> int:
+        if self._free_slot_ids:
+            return heapq.heappop(self._free_slot_ids)
+        slot_id = self._next_slot_id
+        self._next_slot_id += 1
+        return slot_id
+
+    def _release_slot_id(self, slot_id: int | None) -> None:
+        if slot_id is None:
+            return
+        heapq.heappush(self._free_slot_ids, slot_id)
 
     def load(self, name: str, path: str) -> Adapter:
         """Load an adapter from a local path.
@@ -104,29 +130,70 @@ class AdapterManager:
         adapter_path = Path(path)
         config = AdapterConfig.from_file(adapter_path)
         weights = self._load_weights(adapter_path, config)
+        slot_id = self._allocate_slot_id()
 
         adapter = Adapter(
-            name=name, config=config, weights=weights, source_path=path
+            name=name,
+            slot_id=slot_id,
+            config=config,
+            weights=weights,
+            source_path=path,
         )
         self.adapters[name] = adapter
+        self._slot_to_name[slot_id] = name
 
         mb = weights.memory_bytes / 1024 / 1024
-        logger.info(f"Loaded adapter '{name}' ({mb:.1f} MB, rank={config.rank})")
+        logger.info(
+            f"Loaded adapter '{name}' (slot={slot_id}, {mb:.1f} MB, rank={config.rank})"
+        )
         return adapter
 
     def unload(self, name: str) -> None:
         if name not in self.adapters:
             raise KeyError(f"Adapter '{name}' not loaded")
-        del self.adapters[name]
+        adapter = self.adapters.pop(name)
+        if adapter.slot_id is not None:
+            self._slot_to_name.pop(adapter.slot_id, None)
+        self._release_slot_id(adapter.slot_id)
         logger.info(f"Unloaded adapter '{name}'")
 
     def get(self, name: str) -> Adapter | None:
         return self.adapters.get(name)
 
+    def slot_id(self, name: str | None) -> int | None:
+        if name is None:
+            return None
+        adapter = self.adapters.get(name)
+        return adapter.slot_id if adapter else None
+
+    def name_for_slot_id(self, slot_id: int | None) -> str | None:
+        if slot_id is None:
+            return None
+        return self._slot_to_name.get(slot_id)
+
+    def slot_bindings(self) -> list[AdapterSlotBinding]:
+        bindings: list[AdapterSlotBinding] = []
+        for adapter in self.adapters.values():
+            if adapter.slot_id is None:
+                continue
+            bindings.append(
+                AdapterSlotBinding(
+                    name=adapter.name,
+                    slot_id=adapter.slot_id,
+                    rank=adapter.config.rank,
+                    scale=adapter.config.scale,
+                    num_layers=adapter.config.num_layers,
+                    target_modules=tuple(adapter.config.target_modules or ()),
+                    source_path=adapter.source_path,
+                )
+            )
+        return sorted(bindings, key=lambda binding: binding.slot_id)
+
     def list_adapters(self) -> list[dict]:
         return [
             {
                 "name": a.name,
+                "slot_id": a.slot_id,
                 "rank": a.config.rank,
                 "scale": a.config.scale,
                 "num_layers": a.config.num_layers,
@@ -148,6 +215,8 @@ class AdapterManager:
 
         Also derives target_modules from weight keys when not in config.
         """
+        import mlx.core as mx
+
         safetensors_path = adapter_path / "adapters.safetensors"
         raw_weights = mx.load(str(safetensors_path))
 

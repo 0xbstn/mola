@@ -7,14 +7,9 @@ This is the main entry point that ties everything together.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-
-import mlx.core as mx
-import mlx_lm
 
 from mola.adapter import Adapter, AdapterManager
 from mola.context import adapter_context
-from mola.lora import apply_multi_lora, eject_adapter_weights, inject_adapter_weights
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +30,8 @@ class MOLAModel:
     """
 
     def __init__(self, model_path: str):
+        import mlx_lm
+
         logger.info(f"Loading base model: {model_path}")
         self.model, self.tokenizer = mlx_lm.load(model_path)
         self.model_path = model_path
@@ -47,6 +44,8 @@ class MOLAModel:
         First call triggers the model surgery (wrapping Linear -> MultiLoRALinear).
         Subsequent calls just inject new adapter weights.
         """
+        from mola.lora import apply_multi_lora, eject_adapter_weights, inject_adapter_weights
+
         _RESERVED_NAMES = {"base", self.model_path}
         if name in _RESERVED_NAMES:
             raise ValueError(
@@ -76,6 +75,7 @@ class MOLAModel:
             injected = inject_adapter_weights(
                 self.model,
                 adapter_name=name,
+                slot_id=adapter.slot_id,
                 weights=adapter.weights.weights,
                 scale=adapter.config.scale,
             )
@@ -94,11 +94,29 @@ class MOLAModel:
         return adapter
 
     def unload_adapter(self, name: str) -> None:
+        from mola.lora import eject_adapter_weights
+
         eject_adapter_weights(self.model, name)
         self.adapter_manager.unload(name)
 
     def list_adapters(self) -> list[dict]:
         return self.adapter_manager.list_adapters()
+
+    def adapter_slot_bindings(self):
+        return self.adapter_manager.slot_bindings()
+
+    def iter_slot_bound_lora_layers(self):
+        from mola.lora import MultiLoRALinear, MultiLoRASwitchLinear
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, (MultiLoRALinear, MultiLoRASwitchLinear)) and module.slot_ids:
+                yield name, module
+
+    def adapter_slot_id(self, adapter_id: str | None) -> int | None:
+        return self.adapter_manager.slot_id(adapter_id)
+
+    def adapter_name_for_slot_id(self, slot_id: int | None) -> str | None:
+        return self.adapter_manager.name_for_slot_id(slot_id)
 
     @staticmethod
     def _make_sampler(temp: float, top_p: float):
@@ -116,8 +134,10 @@ class MOLAModel:
         top_p: float = 0.9,
     ) -> str:
         """Generate text with an optional adapter."""
+        import mlx_lm
+
         sampler = self._make_sampler(temp, top_p)
-        with adapter_context(adapter_id):
+        with adapter_context(adapter_id, slot_id=self.adapter_slot_id(adapter_id)):
             response = mlx_lm.generate(
                 self.model,
                 self.tokenizer,
@@ -136,8 +156,10 @@ class MOLAModel:
         top_p: float = 0.9,
     ):
         """Yield tokens one by one for streaming. Used by the server."""
+        import mlx_lm
+
         sampler = self._make_sampler(temp, top_p)
-        with adapter_context(adapter_id):
+        with adapter_context(adapter_id, slot_id=self.adapter_slot_id(adapter_id)):
             for step in mlx_lm.stream_generate(
                 self.model,
                 self.tokenizer,

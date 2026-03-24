@@ -73,6 +73,23 @@ class TestMultiLoRALinear:
         diff = mx.abs(y1 - y2).sum().item()
         assert diff > 0, "Different adapters should produce different outputs"
 
+    def test_prefers_slot_lookup_over_name(self):
+        layer = self._make_layer(8, 4)
+        rank = 2
+
+        lora_a = mx.ones((8, rank)) * 0.25
+        lora_b = mx.ones((rank, 4)) * 0.25
+        layer.add_adapter("slot-bound", lora_a, lora_b, scale=1.0, slot_id=5)
+
+        x = mx.ones((1, 8))
+        y_base = layer(x)
+
+        with adapter_context("wrong-name", slot_id=5):
+            y_slot = layer(x)
+
+        diff = mx.abs(y_slot - y_base).sum().item()
+        assert diff > 0, "slot_id should activate the adapter even when the name does not match"
+
     def test_remove_adapter(self):
         layer = self._make_layer()
         lora_a = mx.ones((8, 2)) * 0.1
@@ -154,6 +171,27 @@ class TestInjectEject:
         count = inject_adapter_weights(model, "test_adapter", weights, scale=1.0)
         assert count == 2
 
+    def test_inject_registers_slot_lookup(self):
+        model = _make_tiny_model()
+        apply_multi_lora(model, ["self_attn.q_proj"])
+
+        weights = {}
+        target_layer = None
+        for name, module in model.named_modules():
+            if isinstance(module, MultiLoRALinear):
+                weights[name] = (mx.ones((8, 2)) * 0.1, mx.ones((2, 8)) * 0.1)
+                target_layer = module
+
+        inject_adapter_weights(model, "slot_adapter", weights, scale=1.0, slot_id=9)
+
+        x = mx.ones((1, 8))
+        y_base = target_layer(x)
+        with adapter_context(None, slot_id=9):
+            y_slot = target_layer(x)
+
+        diff = mx.abs(y_slot - y_base).sum().item()
+        assert diff > 0
+
     def test_eject_removes_adapter(self):
         model = _make_tiny_model()
         targets = ["self_attn.q_proj", "self_attn.v_proj"]
@@ -231,7 +269,13 @@ class TestLoadAdapterRollback:
             target_modules=target_modules,
         )
         adapter_weights = AdapterWeights(weights=weights_dict)
-        adapter = Adapter(name=name, config=config, weights=adapter_weights, source_path="/fake")
+        adapter = Adapter(
+            name=name,
+            slot_id=len(adapter_mgr.adapters),
+            config=config,
+            weights=adapter_weights,
+            source_path="/fake",
+        )
         adapter_mgr.adapters[name] = adapter
         return adapter
 

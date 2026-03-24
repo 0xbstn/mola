@@ -18,12 +18,11 @@ and applies the corresponding delta. The model architecture code stays untouched
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mola.context import get_current_adapter
+from mola.context import get_current_adapter, get_current_slot_id
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +39,17 @@ class MultiLoRALinear(nn.Module):
         super().__init__()
         self.linear = base_linear
         self._adapters: dict[str, tuple[mx.array, mx.array, float]] = {}
+        self._adapters_by_slot: dict[int, tuple[mx.array, mx.array, float]] = {}
+        self._slot_by_adapter: dict[str, int] = {}
 
-    def add_adapter(self, name: str, lora_a: mx.array, lora_b: mx.array, scale: float):
+    def add_adapter(
+        self,
+        name: str,
+        lora_a: mx.array,
+        lora_b: mx.array,
+        scale: float,
+        slot_id: int | None = None,
+    ):
         if lora_a.shape[1] != lora_b.shape[0]:
             raise ValueError(
                 f"LoRA rank mismatch for adapter '{name}': "
@@ -57,9 +65,16 @@ class MultiLoRALinear(nn.Module):
             if lora_b.shape[1] != out_features:
                 raise ValueError(
                     f"LoRA output dim mismatch for adapter '{name}': "
-                    f"lora_b has {lora_b.shape[1]}, base layer expects {out_features}"
+                    f"lora_b has {tuple(lora_b.shape)} vs base layer expects {out_features}"
                 )
-        self._adapters[name] = (lora_a, lora_b, scale)
+        binding = (lora_a, lora_b, scale)
+        self._adapters[name] = binding
+        if slot_id is not None:
+            previous_slot = self._slot_by_adapter.get(name)
+            if previous_slot is not None and previous_slot != slot_id:
+                self._adapters_by_slot.pop(previous_slot, None)
+            self._adapters_by_slot[slot_id] = binding
+            self._slot_by_adapter[name] = slot_id
 
     def _base_dims(self) -> tuple[int | None, int | None]:
         """Extract (input_dims, output_dims) from the wrapped linear layer."""
@@ -76,7 +91,11 @@ class MultiLoRALinear(nn.Module):
         return None, None
 
     def remove_adapter(self, name: str):
-        self._adapters.pop(name, None)
+        if self._adapters.pop(name, None) is None:
+            return
+        slot_id = self._slot_by_adapter.pop(name, None)
+        if slot_id is not None:
+            self._adapters_by_slot.pop(slot_id, None)
 
     def has_adapter(self, name: str) -> bool:
         return name in self._adapters
@@ -85,12 +104,34 @@ class MultiLoRALinear(nn.Module):
     def adapter_names(self) -> list[str]:
         return list(self._adapters.keys())
 
+    @property
+    def slot_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._adapters_by_slot))
+
+    def slot_bindings(self) -> list[tuple[int, mx.array, mx.array, float]]:
+        return [
+            (slot_id, *self._adapters_by_slot[slot_id])
+            for slot_id in self.slot_ids
+        ]
+
+    def _active_binding(self) -> tuple[mx.array, mx.array, float] | None:
+        slot_id = get_current_slot_id()
+        if slot_id is not None:
+            binding = self._adapters_by_slot.get(slot_id)
+            if binding is not None:
+                return binding
+
+        adapter_id = get_current_adapter()
+        if adapter_id is None:
+            return None
+        return self._adapters.get(adapter_id)
+
     def __call__(self, x: mx.array) -> mx.array:
         y = self.linear(x)
 
-        adapter_id = get_current_adapter()
-        if adapter_id is not None and adapter_id in self._adapters:
-            lora_a, lora_b, scale = self._adapters[adapter_id]
+        binding = self._active_binding()
+        if binding is not None:
+            lora_a, lora_b, scale = binding
             delta = (x @ lora_a) @ lora_b
             y = y + (scale * delta).astype(y.dtype)
 
@@ -108,19 +149,64 @@ class MultiLoRASwitchLinear(nn.Module):
         super().__init__()
         self.linear = base_linear
         self._adapters: dict[str, tuple[mx.array, mx.array, float]] = {}
+        self._adapters_by_slot: dict[int, tuple[mx.array, mx.array, float]] = {}
+        self._slot_by_adapter: dict[str, int] = {}
 
-    def add_adapter(self, name: str, lora_a: mx.array, lora_b: mx.array, scale: float):
-        self._adapters[name] = (lora_a, lora_b, scale)
+    def add_adapter(
+        self,
+        name: str,
+        lora_a: mx.array,
+        lora_b: mx.array,
+        scale: float,
+        slot_id: int | None = None,
+    ):
+        binding = (lora_a, lora_b, scale)
+        self._adapters[name] = binding
+        if slot_id is not None:
+            previous_slot = self._slot_by_adapter.get(name)
+            if previous_slot is not None and previous_slot != slot_id:
+                self._adapters_by_slot.pop(previous_slot, None)
+            self._adapters_by_slot[slot_id] = binding
+            self._slot_by_adapter[name] = slot_id
 
     def remove_adapter(self, name: str):
-        self._adapters.pop(name, None)
+        if self._adapters.pop(name, None) is None:
+            return
+        slot_id = self._slot_by_adapter.pop(name, None)
+        if slot_id is not None:
+            self._adapters_by_slot.pop(slot_id, None)
+
+    def has_adapter(self, name: str) -> bool:
+        return name in self._adapters
+
+    @property
+    def slot_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._adapters_by_slot))
+
+    def slot_bindings(self) -> list[tuple[int, mx.array, mx.array, float]]:
+        return [
+            (slot_id, *self._adapters_by_slot[slot_id])
+            for slot_id in self.slot_ids
+        ]
+
+    def _active_binding(self) -> tuple[mx.array, mx.array, float] | None:
+        slot_id = get_current_slot_id()
+        if slot_id is not None:
+            binding = self._adapters_by_slot.get(slot_id)
+            if binding is not None:
+                return binding
+
+        adapter_id = get_current_adapter()
+        if adapter_id is None:
+            return None
+        return self._adapters.get(adapter_id)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         y = self.linear(x, indices)
 
-        adapter_id = get_current_adapter()
-        if adapter_id is not None and adapter_id in self._adapters:
-            lora_a, lora_b, scale = self._adapters[adapter_id]
+        binding = self._active_binding()
+        if binding is not None:
+            lora_a, lora_b, scale = binding
             # Per-expert LoRA: lora_a is [num_experts, r, d_in]
             delta = mx.gather_mm(
                 mx.gather_mm(x, lora_a, rhs_indices=indices),
@@ -168,7 +254,11 @@ def apply_multi_lora(model: nn.Module, target_modules: list[str] | None = None):
 
 
 def inject_adapter_weights(
-    model: nn.Module, adapter_name: str, weights: dict[str, tuple[mx.array, mx.array]], scale: float
+    model: nn.Module,
+    adapter_name: str,
+    weights: dict[str, tuple[mx.array, mx.array]],
+    scale: float,
+    slot_id: int | None = None,
 ):
     """Load an adapter's weights into the model's MultiLoRALinear layers.
 
@@ -183,7 +273,7 @@ def inject_adapter_weights(
         if isinstance(module, (MultiLoRALinear, MultiLoRASwitchLinear)):
             if name in weights:
                 lora_a, lora_b = weights[name]
-                module.add_adapter(adapter_name, lora_a, lora_b, scale)
+                module.add_adapter(adapter_name, lora_a, lora_b, scale, slot_id=slot_id)
                 injected += 1
 
     logger.info(f"Injected adapter '{adapter_name}' into {injected} layers")

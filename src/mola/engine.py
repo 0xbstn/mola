@@ -9,8 +9,10 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
+from mola.adapter import AdapterSlotBinding
+from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, build_layer_slot_pack_views, materialize_layer_slot_packs
 from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPolicy
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
 from mola.context import adapter_context
@@ -22,6 +24,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RequestKey = tuple[str | None, int]
+
+
+@dataclass(frozen=True)
+class RuntimeSlotLayout:
+    loaded_slot_ids: tuple[int, ...]
+    active_slot_ids: tuple[int, ...]
+    pending_slot_ids: tuple[int, ...]
 
 
 @dataclass
@@ -41,10 +50,17 @@ class SlotMetrics:
     steps_called: int = 0
     tokens_emitted: int = 0
     total_next_ms: float = 0.0
+    total_step_lock_wait_ms: float = 0.0
+    max_step_lock_wait_ms: float = 0.0
+    insert_calls: int = 0
+    inserted_requests: int = 0
+    total_insert_ms: float = 0.0
+    total_insert_lock_wait_ms: float = 0.0
+    max_insert_lock_wait_ms: float = 0.0
     last_step_ts: float = 0.0
     max_gap_ms: float = 0.0
 
-    def record_step(self, duration_ms: float, tokens: int):
+    def record_step(self, duration_ms: float, lock_wait_ms: float, tokens: int):
         now = time.time()
         if self.last_step_ts > 0:
             gap = (now - self.last_step_ts) * 1000
@@ -54,12 +70,30 @@ class SlotMetrics:
         self.steps_called += 1
         self.tokens_emitted += tokens
         self.total_next_ms += duration_ms
+        self.total_step_lock_wait_ms += lock_wait_ms
+        if lock_wait_ms > self.max_step_lock_wait_ms:
+            self.max_step_lock_wait_ms = lock_wait_ms
+
+    def record_insert(self, duration_ms: float, lock_wait_ms: float, requests: int):
+        self.insert_calls += 1
+        self.inserted_requests += requests
+        self.total_insert_ms += duration_ms
+        self.total_insert_lock_wait_ms += lock_wait_ms
+        if lock_wait_ms > self.max_insert_lock_wait_ms:
+            self.max_insert_lock_wait_ms = lock_wait_ms
 
     def snapshot(self) -> dict:
         return {
             "steps": self.steps_called,
             "tokens": self.tokens_emitted,
             "avg_next_ms": round(self.total_next_ms / self.steps_called, 2) if self.steps_called else 0,
+            "avg_step_lock_wait_ms": round(self.total_step_lock_wait_ms / self.steps_called, 2) if self.steps_called else 0,
+            "max_step_lock_wait_ms": round(self.max_step_lock_wait_ms, 2),
+            "insert_calls": self.insert_calls,
+            "inserted_requests": self.inserted_requests,
+            "avg_insert_ms": round(self.total_insert_ms / self.insert_calls, 2) if self.insert_calls else 0,
+            "avg_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms / self.insert_calls, 2) if self.insert_calls else 0,
+            "max_insert_lock_wait_ms": round(self.max_insert_lock_wait_ms, 2),
             "max_gap_ms": round(self.max_gap_ms, 1),
         }
 
@@ -74,6 +108,8 @@ class EngineMetrics:
     requests_rejected: int = 0
     inflight_tokens_reserved: int = 0
     token_budget_limit: int = 0
+    total_step_lock_wait_ms: float = 0.0
+    total_insert_lock_wait_ms: float = 0.0
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -95,6 +131,8 @@ class EngineMetrics:
             "requests_rejected": self.requests_rejected,
             "inflight_tokens_reserved": self.inflight_tokens_reserved,
             "token_budget_limit": self.token_budget_limit,
+            "total_step_lock_wait_ms": round(self.total_step_lock_wait_ms, 2),
+            "total_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms, 2),
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -277,6 +315,7 @@ class MOLAEngine:
         with self._state_lock:
             return {
                 str(aid): {
+                    "runtime_slot_id": self._adapter_slot_id(aid),
                     "active_uids": len(slot.active_uids),
                     "batch_size": len(slot.active_uids),
                     "pending_requests": len(slot.pending_requests),
@@ -288,6 +327,78 @@ class MOLAEngine:
                 }
                 for aid, slot in self._generators.items()
             }
+
+    def runtime_slot_layout(self) -> RuntimeSlotLayout:
+        bindings = getattr(self.mola_model, "adapter_slot_bindings", None)
+        loaded_slot_ids: tuple[int, ...] = ()
+        if callable(bindings):
+            loaded_slot_ids = tuple(
+                binding.slot_id for binding in bindings() if binding.slot_id is not None
+            )
+
+        active_slot_ids: list[int] = []
+        pending_slot_ids: list[int] = []
+        with self._state_lock:
+            for adapter_id, slot in self._generators.items():
+                runtime_slot_id = self._adapter_slot_id(adapter_id)
+                if runtime_slot_id is None:
+                    continue
+                if slot.active_uids:
+                    active_slot_ids.append(runtime_slot_id)
+                if slot.pending_requests:
+                    pending_slot_ids.append(runtime_slot_id)
+
+        return RuntimeSlotLayout(
+            loaded_slot_ids=tuple(sorted(set(loaded_slot_ids))),
+            active_slot_ids=tuple(sorted(set(active_slot_ids))),
+            pending_slot_ids=tuple(sorted(set(pending_slot_ids))),
+        )
+
+    def active_slot_bindings(self) -> tuple[AdapterSlotBinding, ...]:
+        bindings = getattr(self.mola_model, "adapter_slot_bindings", None)
+        if not callable(bindings):
+            return ()
+
+        layout = self.runtime_slot_layout()
+        relevant_slot_ids = set(layout.active_slot_ids) | set(layout.pending_slot_ids)
+        if not relevant_slot_ids:
+            return ()
+
+        return tuple(sorted(
+            (
+                binding
+                for binding in bindings()
+                if binding.slot_id in relevant_slot_ids
+            ),
+            key=lambda binding: binding.slot_id,
+        ))
+
+    def layer_slot_pack_views(self) -> tuple[LayerSlotPackView, ...]:
+        iter_layers = getattr(self.mola_model, "iter_slot_bound_lora_layers", None)
+        if not callable(iter_layers):
+            return ()
+        return build_layer_slot_pack_views(
+            self.active_slot_bindings(),
+            iter_layers(),
+        )
+
+    def materialize_layer_slot_packs(
+        self,
+        stack_fn: Callable[[list[Any]], Any],
+    ) -> tuple[MaterializedLayerSlotPack, ...]:
+        return materialize_layer_slot_packs(
+            self.layer_slot_pack_views(),
+            stack_fn=stack_fn,
+        )
+
+    def _adapter_slot_id(self, adapter_id: str | None) -> int | None:
+        resolver = getattr(self.mola_model, "adapter_slot_id", None)
+        if not callable(resolver):
+            return None
+        slot_id = resolver(adapter_id)
+        if slot_id is None or isinstance(slot_id, int):
+            return slot_id
+        return None
 
     def _run(self):
         cleanup_interval = 10.0
@@ -570,9 +681,12 @@ class MOLAEngine:
         logger.debug(
             f"slot_step_start adapter={slot.adapter_id} active={active_count}"
         )
-        t0 = time.monotonic()
+        runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
+        lock_wait_start = time.monotonic()
         with self.model_lock:
-            with adapter_context(slot.adapter_id):
+            lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
+            t0 = time.monotonic()
+            with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
                 try:
                     responses = slot.generator.step()
                 except StopIteration:
@@ -598,7 +712,8 @@ class MOLAEngine:
                 finished_uids.add(resp.handle.uid)
 
         with self._state_lock:
-            slot.slot_metrics.record_step(step_ms, len(responses))
+            slot.slot_metrics.record_step(step_ms, lock_wait_ms, len(responses))
+            self.metrics.total_step_lock_wait_ms += lock_wait_ms
             slot.service_debt = max(0.0, slot.service_debt - 1.0)
             slot.last_active = time.time()
             slot.last_service_ts = slot.last_active
@@ -608,7 +723,8 @@ class MOLAEngine:
             self._update_sequence_count_locked()
         logger.debug(
             f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
-            f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f}"
+            f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f} "
+            f"lock_wait_ms={lock_wait_ms:.1f} runtime_slot_id={runtime_slot_id}"
         )
 
     def _should_run_prefill(self, *, iteration: int, has_decode: bool) -> bool:
@@ -660,11 +776,16 @@ class MOLAEngine:
             return False
 
         try:
+            runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
+            lock_wait_start = time.monotonic()
             with self.model_lock:
-                with adapter_context(slot.adapter_id):
+                lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
+                t0 = time.monotonic()
+                with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
                     handles = slot.generator.submit_batch(
                         [req.to_submission() for req in batch]
                     )
+            insert_ms = (time.monotonic() - t0) * 1000
         except Exception:
             logger.exception(f"BatchGenerator insert error for adapter '{slot.adapter_id}'")
             for req in batch:
@@ -678,6 +799,8 @@ class MOLAEngine:
 
         inserted_at = time.time()
         with self._state_lock:
+            slot.slot_metrics.record_insert(insert_ms, lock_wait_ms, len(batch))
+            self.metrics.total_insert_lock_wait_ms += lock_wait_ms
             for req, handle in zip(batch, handles, strict=True):
                 uid = handle.uid
                 req.uid = uid
@@ -693,6 +816,10 @@ class MOLAEngine:
             slot.last_service_ts = inserted_at
             self.metrics.queued_requests = self._queued_request_count_locked()
             self._update_sequence_count_locked()
+        logger.debug(
+            f"slot_insert_done adapter={slot.adapter_id} batch={len(batch)} insert_ms={insert_ms:.1f} "
+            f"lock_wait_ms={lock_wait_ms:.1f} runtime_slot_id={runtime_slot_id}"
+        )
         return True
 
     def _queued_request_count_locked(self) -> int:

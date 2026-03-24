@@ -1,15 +1,4 @@
-"""Adapter context threading.
-
-The trickiest problem in multi-LoRA: how to tell each layer which adapter to use
-during a forward pass, WITHOUT modifying any mlx-lm model code.
-
-Solution: contextvars. Same pattern as Flask's request context or SQLAlchemy's session.
-The MultiLoRALinear layer reads the current adapter from the context variable.
-The server sets it before each forward pass.
-
-    with adapter_context("solana"):
-        output = model(x)  # all MultiLoRALinear layers use the "solana" adapter
-"""
+"""Adapter context for the current forward pass."""
 
 from __future__ import annotations
 
@@ -19,18 +8,25 @@ from contextlib import contextmanager
 _current_adapter: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mola_adapter", default=None
 )
+_current_slot_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "mola_adapter_slot", default=None
+)
 
 
 @contextmanager
-def adapter_context(adapter_id: str | None):
-    """Set the active adapter for the duration of a forward pass."""
-    token = _current_adapter.set(adapter_id)
+def adapter_context(adapter_id: str | None, slot_id: int | None = None):
+    adapter_token = _current_adapter.set(adapter_id)
+    slot_token = _current_slot_id.set(slot_id)
     try:
         yield
     finally:
-        _current_adapter.reset(token)
+        _current_slot_id.reset(slot_token)
+        _current_adapter.reset(adapter_token)
 
 
 def get_current_adapter() -> str | None:
-    """Get the currently active adapter ID. Called by MultiLoRALinear."""
     return _current_adapter.get()
+
+
+def get_current_slot_id() -> int | None:
+    return _current_slot_id.get()

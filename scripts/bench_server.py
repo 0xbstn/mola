@@ -78,6 +78,8 @@ class ScenarioResult:
     engine_tokens: int
     engine_completed: int
     engine_tok_s: float
+    engine_step_lock_wait_ms: float
+    engine_insert_lock_wait_ms: float
     models: list[str]
 
 
@@ -302,6 +304,12 @@ async def _run_scenario(
     avg_chars = sum(r.chars for r in results) / len(results) if results else 0.0
     token_delta = after["total_tokens_generated"] - before["total_tokens_generated"]
     completed_delta = after["requests_completed"] - before["requests_completed"]
+    step_lock_wait_delta = (
+        after.get("total_step_lock_wait_ms", 0.0) - before.get("total_step_lock_wait_ms", 0.0)
+    )
+    insert_lock_wait_delta = (
+        after.get("total_insert_lock_wait_ms", 0.0) - before.get("total_insert_lock_wait_ms", 0.0)
+    )
 
     return ScenarioResult(
         scenario=scenario,
@@ -316,6 +324,8 @@ async def _run_scenario(
         engine_tokens=token_delta,
         engine_completed=completed_delta,
         engine_tok_s=(token_delta / wall_s) if wall_s > 0 else 0.0,
+        engine_step_lock_wait_ms=step_lock_wait_delta,
+        engine_insert_lock_wait_ms=insert_lock_wait_delta,
         models=models,
     )
 
