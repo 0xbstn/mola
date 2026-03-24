@@ -52,7 +52,7 @@ def main(verbose: bool):
 )
 @click.option(
     "--routed-decode-backend",
-    type=click.Choice(["reference", "metal-kernel"]),
+    type=click.Choice(["reference", "metal-kernel", "gather-mm"]),
     default="reference",
     show_default=True,
     help="Backend used behind the routed decode session factory when routed decode is enabled",

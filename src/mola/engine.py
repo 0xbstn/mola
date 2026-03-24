@@ -830,6 +830,12 @@ class MOLAEngine:
             return MetalKernelRoutedLoRADeltaSessionFactory(
                 strict=self.config.strict_routed_decode_reference
             )
+        if self.config.routed_decode_backend == "gather-mm":
+            from mola.infrastructure.gather_mm_routed_decode import GatherMMRoutedLoRADeltaSessionFactory
+
+            return GatherMMRoutedLoRADeltaSessionFactory(
+                strict=self.config.strict_routed_decode_reference
+            )
         raise ValueError(
             f"unsupported routed_decode_backend: {self.config.routed_decode_backend}"
         )
