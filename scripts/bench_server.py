@@ -103,6 +103,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-models", default=None)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--require-routed-decode-reference",
+        action="store_true",
+        help="Fail fast unless /v1/engine/metrics reports routed_decode_reference_enabled=true",
+    )
+    parser.add_argument(
         "--extended",
         action="store_true",
         help="Include long-prefill, long-decode, and fairness scenarios",
@@ -426,13 +431,23 @@ def _build_scenarios(
     return scenarios
 
 
-def _print_header(base_url: str, health: dict, adapters: list[dict], scenarios: list[ScenarioSpec]):
+def _print_header(
+    base_url: str,
+    health: dict,
+    adapters: list[dict],
+    scenarios: list[ScenarioSpec],
+    engine_metrics: dict[str, Any],
+):
     print("=" * 88)
     print("MOLA v2 Benchmark")
     print("=" * 88)
     print(f"Base URL: {base_url}")
     print(f"Model:    {health['model']}")
     print(f"Adapters: {', '.join(a['name'] for a in adapters) if adapters else '(none)'}")
+    print(
+        "Routed decode reference: "
+        f"{engine_metrics.get('routed_decode_reference_enabled', False)}"
+    )
     print("Scenarios:")
     for scenario in scenarios:
         suffix = ""
@@ -467,6 +482,13 @@ async def main():
 
     async with httpx.AsyncClient(timeout=args.timeout) as client:
         health = await _get_json(client, f"{args.base_url}/health")
+        engine_metrics = await _get_json(client, f"{args.base_url}/v1/engine/metrics")
+        if args.require_routed_decode_reference and not engine_metrics.get(
+            "routed_decode_reference_enabled", False
+        ):
+            raise SystemExit(
+                "Server is not running with routed_decode_reference_enabled=true"
+            )
         adapters_payload = await _get_json(client, f"{args.base_url}/v1/adapters")
         adapters = adapters_payload["adapters"]
         adapter_names = [a["name"] for a in adapters]
@@ -490,7 +512,7 @@ async def main():
             long_decode_tokens=args.long_decode_tokens,
         )
 
-        _print_header(args.base_url, health, adapters, scenarios)
+        _print_header(args.base_url, health, adapters, scenarios, engine_metrics)
 
         if args.warmup > 0:
             print(f"Warming up with {args.warmup} request(s) on {same_model}...")
