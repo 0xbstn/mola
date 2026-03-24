@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RequestKey = tuple[str | None, int]
+GeneratorKey = str | None
+RequestKey = tuple[GeneratorKey, int]
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,7 @@ class GenerateRequest:
 class _AdapterSlot:
     generator: GeneratorPort
     adapter_id: str | None
+    generator_key: GeneratorKey | None = None
     active_uids: set[int] = field(default_factory=set)
     pending_requests: deque[GenerateRequest] = field(default_factory=deque)
     service_debt: float = 0.0
@@ -285,6 +287,25 @@ class MOLAEngine:
         for slot in slots:
             self._close_generator(slot)
         logger.info("Engine stopped")
+
+    def _slot_generator_key(self, slot: _AdapterSlot) -> GeneratorKey:
+        if slot.generator_key is not None:
+            return slot.generator_key
+        return slot.adapter_id
+
+    def _request_key(self, generator_key: GeneratorKey, uid: int) -> RequestKey:
+        return (generator_key, uid)
+
+    def _slot_request_key(self, slot: _AdapterSlot, uid: int) -> RequestKey:
+        return self._request_key(self._slot_generator_key(slot), uid)
+
+    def _find_slot_by_generator_key_locked(
+        self, generator_key: GeneratorKey
+    ) -> _AdapterSlot | None:
+        for slot in self._generators.values():
+            if self._slot_generator_key(slot) == generator_key:
+                return slot
+        return None
 
     def submit(self, request: GenerateRequest):
         with self._state_lock:
@@ -562,7 +583,7 @@ class MOLAEngine:
         if not self.config.enable_routed_decode_reference:
             return None
         for uid in slot.active_uids:
-            req = self._uid_to_request.get((slot.adapter_id, uid))
+            req = self._uid_to_request.get(self._slot_request_key(slot, uid))
             if req is None or req.first_token_at is None:
                 return None
         return self._build_homogeneous_decode_routed_session_for_slot(slot)
@@ -673,10 +694,10 @@ class MOLAEngine:
             ]
             self.metrics.queued_requests = self._queued_request_count_locked()
 
-        for adapter_id, uid in to_remove:
+        for generator_key, uid in to_remove:
             removed = False
             with self._state_lock:
-                slot = self._generators.get(adapter_id)
+                slot = self._find_slot_by_generator_key_locked(generator_key)
             if slot and uid in slot.active_uids:
                 try:
                     slot.generator.cancel([GeneratorHandle(uid=uid)])
@@ -686,28 +707,29 @@ class MOLAEngine:
                 with self._state_lock:
                     slot.active_uids.discard(uid)
             logger.debug(
-                f"cancel_remove uid={uid} adapter={adapter_id} removed={removed}"
+                f"cancel_remove uid={uid} adapter={slot.adapter_id if slot else generator_key} removed={removed}"
             )
             with self._state_lock:
-                req = self._uid_to_request.pop((adapter_id, uid), None)
+                req = self._uid_to_request.pop(
+                    self._request_key(generator_key, uid), None
+                )
                 if req:
                     self._send_to_queue(req, {"error": "internal error"})
                     self._send_to_queue(req, None)
-                    with self._state_lock:
-                        self._release_budget_locked(req)
+                    self._release_budget_locked(req)
                 if slot and not slot.active_uids and not slot.pending_requests:
                     slot.service_debt = 0.0
                 self._update_sequence_count_locked()
 
     def _dispatch_token(
         self,
-        adapter_id: str | None,
+        generator_key: GeneratorKey,
         uid: int,
         token: int,
         finish_reason: str | None,
     ):
         with self._state_lock:
-            req = self._uid_to_request.get((adapter_id, uid))
+            req = self._uid_to_request.get(self._request_key(generator_key, uid))
             if not req or req.cancelled:
                 return
 
@@ -751,7 +773,7 @@ class MOLAEngine:
                 f"total={now - req.created_at:.3f}s"
             )
             with self._state_lock:
-                self._uid_to_request.pop((adapter_id, uid), None)
+                self._uid_to_request.pop(self._request_key(generator_key, uid), None)
                 self._release_budget_locked(req)
                 self._update_sequence_count_locked()
 
@@ -778,7 +800,7 @@ class MOLAEngine:
                 self._release_budget_locked(req)
         for uid in uids:
             with self._state_lock:
-                req = self._uid_to_request.pop((slot.adapter_id, uid), None)
+                req = self._uid_to_request.pop(self._slot_request_key(slot, uid), None)
             if req:
                 self._send_to_queue(req, {"error": error_msg})
                 self._send_to_queue(req, None)
@@ -802,7 +824,11 @@ class MOLAEngine:
             completion_batch_size=self.config.max_batch_size,
             prefill_batch_size=self.config.prefill_batch_size,
         )
-        slot = _AdapterSlot(generator=gen, adapter_id=adapter_id)
+        slot = _AdapterSlot(
+            generator=gen,
+            adapter_id=adapter_id,
+            generator_key=adapter_id,
+        )
         with self._state_lock:
             if adapter_id in self._generators:
                 self._close_generator(slot)
@@ -929,7 +955,10 @@ class MOLAEngine:
             resp_uids.append(resp.handle.uid)
             resp_reasons.append(resp.finish_reason)
             self._dispatch_token(
-                slot.adapter_id, resp.handle.uid, resp.token, resp.finish_reason
+                self._slot_generator_key(slot),
+                resp.handle.uid,
+                resp.token,
+                resp.finish_reason,
             )
             if resp.finish_reason is not None:
                 finished_uids.add(resp.handle.uid)
@@ -972,7 +1001,7 @@ class MOLAEngine:
     def _oldest_unstarted_ts_locked(self, slot: _AdapterSlot) -> float | None:
         candidates = [req.created_at for req in slot.pending_requests]
         for uid in slot.active_uids:
-            req = self._uid_to_request.get((slot.adapter_id, uid))
+            req = self._uid_to_request.get(self._slot_request_key(slot, uid))
             if req and req.first_token_at is None:
                 candidates.append(req.created_at)
         return min(candidates) if candidates else None
@@ -1029,7 +1058,7 @@ class MOLAEngine:
                 req.uid = uid
                 req.inserted_at = inserted_at
                 slot.active_uids.add(uid)
-                self._uid_to_request[(slot.adapter_id, uid)] = req
+                self._uid_to_request[self._slot_request_key(slot, uid)] = req
                 logger.debug(
                     f"drain_insert queue={req.qid} adapter={req.adapter_id} uid={uid} "
                     f"slot_active={len(slot.active_uids)} generators={len(self._generators)} "

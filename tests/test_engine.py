@@ -27,6 +27,7 @@ from mola.engine import (
     _get_stop_tokens,
 )
 from mola.adapter import AdapterSlotBinding
+from mola.ports.generator import GeneratorHandle
 
 
 def _tuple_routed_session_factory():
@@ -1002,6 +1003,37 @@ class TestUidNamespacing:
 
         assert rust_req.response_queue.get_nowait()["token"] == 11
         assert sql_req.response_queue.get_nowait()["token"] == 22
+
+    def test_dispatch_routes_using_generator_key_not_adapter_id(self):
+        engine = _make_engine()
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        engine._uid_to_request[("adapted", 0)] = req
+        engine._send_to_queue = lambda target_req, data: (
+            target_req.response_queue.put_nowait(data),
+            True,
+        )[1]
+
+        engine._dispatch_token("adapted", 0, 11, None)
+
+        assert req.response_queue.get_nowait()["token"] == 11
+
+    def test_process_cancelled_uses_generator_key_to_find_slot(self):
+        engine = _make_engine()
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.cancelled = True
+        slot = _AdapterSlot(
+            generator=MagicMock(),
+            adapter_id="rust",
+            generator_key="adapted",
+            active_uids={0},
+        )
+        engine._generators["rust"] = slot
+        engine._uid_to_request[("adapted", 0)] = req
+
+        engine._process_cancelled()
+
+        slot.generator.cancel.assert_called_once_with([GeneratorHandle(uid=0)])
+        assert ("adapted", 0) not in engine._uid_to_request
 
 
 class TestScheduling:
