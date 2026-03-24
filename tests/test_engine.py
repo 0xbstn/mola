@@ -13,6 +13,7 @@ import pytest
 
 from mola.engine import (
     AdmissionRejected,
+    DecodeRowBinding,
     EngineConfig,
     EngineMetrics,
     GenerateRequest,
@@ -552,6 +553,54 @@ class TestAdapterSlotResolution:
 
         assert state is None
         assert token_slot_ids is None
+
+    def test_decode_row_bindings_follow_scheduler_and_generator_order(self):
+        engine = _make_engine()
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1, 2})
+        rust_slot.generator.active_handles.return_value = (MagicMock(uid=21), MagicMock(uid=22))
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql", active_uids={3})
+        sql_slot.generator.active_handles.return_value = (MagicMock(uid=31),)
+        engine._ordered_slots = lambda: [sql_slot, rust_slot]
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        bindings = engine.decode_row_bindings()
+
+        assert bindings == (
+            DecodeRowBinding("sql", 2, 31),
+            DecodeRowBinding("rust", 1, 21),
+            DecodeRowBinding("rust", 1, 22),
+        )
+
+    def test_build_active_decode_context_uses_decode_row_bindings(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+        ]
+        engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (2, "a-sql", "b-sql", 20.0),
+                    (1, "a-rust", "b-rust", 16.0),
+                ]),
+            ),
+        ])
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1, 2})
+        rust_slot.generator.active_handles.return_value = (MagicMock(uid=21), MagicMock(uid=22))
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql", active_uids={3})
+        sql_slot.generator.active_handles.return_value = (MagicMock(uid=31),)
+        engine._generators = {"sql": sql_slot, "rust": rust_slot}
+        engine._ordered_slots = lambda: [sql_slot, rust_slot]
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        state, token_slot_ids = engine.build_active_decode_context(
+            stack_fn=lambda values: tuple(values),
+            scale_fn=lambda values: tuple(values),
+        )
+
+        assert token_slot_ids == (2, 1, 1)
+        assert state.get("layers.0.q_proj") is not None
 
     def test_step_slot_builds_homogeneous_routed_context_under_model_lock(self):
         engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))

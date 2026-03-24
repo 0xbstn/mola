@@ -33,6 +33,13 @@ class RuntimeSlotLayout:
     pending_slot_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class DecodeRowBinding:
+    adapter_id: str | None
+    slot_id: int
+    uid: int
+
+
 @dataclass
 class EngineConfig:
     max_queued_requests: int = 128
@@ -444,6 +451,38 @@ class MOLAEngine:
                 scale_fn=scale_fn,
             ),
             tuple(token_slot_ids),
+        )
+
+    def decode_row_bindings(self) -> tuple[DecodeRowBinding, ...]:
+        bindings: list[DecodeRowBinding] = []
+        for slot in self._ordered_slots():
+            if not slot.active_uids:
+                continue
+            runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
+            if runtime_slot_id is None:
+                continue
+            for handle in slot.generator.active_handles():
+                bindings.append(
+                    DecodeRowBinding(
+                        adapter_id=slot.adapter_id,
+                        slot_id=runtime_slot_id,
+                        uid=handle.uid,
+                    )
+                )
+        return tuple(bindings)
+
+    def build_active_decode_context(
+        self,
+        *,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+        row_bindings = self.decode_row_bindings()
+        token_slot_ids = tuple(binding.slot_id for binding in row_bindings)
+        return self.build_routed_decode_context(
+            token_slot_ids,
+            stack_fn=stack_fn,
+            scale_fn=scale_fn,
         )
 
     def build_homogeneous_decode_context(
