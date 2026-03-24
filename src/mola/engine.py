@@ -556,6 +556,10 @@ class MOLAEngine:
     ) -> RoutedLoRADeltaSession | None:
         if not self.config.enable_routed_decode_reference:
             return None
+        for uid in slot.active_uids:
+            req = self._uid_to_request.get((slot.adapter_id, uid))
+            if req is None or req.first_token_at is None:
+                return None
         return self._build_homogeneous_decode_routed_session_for_slot(slot)
 
     def _adapter_slot_id(self, adapter_id: str | None) -> int | None:

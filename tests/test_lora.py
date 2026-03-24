@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mola.context import adapter_context
+from mola.context import adapter_context, routed_decode_context
 from mola.lora import (
     MultiLoRALinear,
     apply_multi_lora,
@@ -89,6 +89,28 @@ class TestMultiLoRALinear:
 
         diff = mx.abs(y_slot - y_base).sum().item()
         assert diff > 0, "slot_id should activate the adapter even when the name does not match"
+
+    def test_routed_decode_skips_unbound_layers_for_current_slot(self):
+        class _Session:
+            def delta(self, layer_name, x):
+                raise AssertionError(f"routed session should not run for {layer_name}")
+
+        layer = MultiLoRALinear(nn.Linear(8, 4), layer_name="model.layers.0.self_attn.q_proj")
+        layer.add_adapter(
+            "slot-bound",
+            mx.ones((8, 2)) * 0.25,
+            mx.ones((2, 4)) * 0.25,
+            scale=1.0,
+            slot_id=9,
+        )
+
+        x = mx.ones((1, 8))
+        y_base = layer(x)
+        with adapter_context("wrong-name", slot_id=5):
+            with routed_decode_context(_Session()):
+                y = layer(x)
+
+        assert mx.allclose(y, y_base)
 
     def test_remove_adapter(self):
         layer = self._make_layer()

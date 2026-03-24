@@ -644,6 +644,59 @@ class TestAdapterSlotResolution:
 
         assert session is None
 
+    def test_maybe_build_decode_routed_session_skips_prefill_stage(self):
+        engine = _make_engine(
+            config=EngineConfig(enable_routed_decode_reference=True),
+            routed_decode_session_factory=_tuple_routed_session_factory(),
+        )
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+        ]
+        engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (1, "a-rust", "b-rust", 16.0),
+                ]),
+            ),
+        ])
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1}.get(adapter_id)
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={7})
+        slot.generator.active_handles.return_value = (MagicMock(uid=7),)
+        engine._uid_to_request[("rust", 7)] = GenerateRequest([1, 2, 3], "rust", 16, None, asyncio.Queue())
+
+        session = engine._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
+
+        assert session is None
+
+    def test_maybe_build_decode_routed_session_allows_decode_stage(self):
+        engine = _make_engine(
+            config=EngineConfig(enable_routed_decode_reference=True),
+            routed_decode_session_factory=_tuple_routed_session_factory(),
+        )
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+        ]
+        engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (1, "a-rust", "b-rust", 16.0),
+                ]),
+            ),
+        ])
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1}.get(adapter_id)
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={7})
+        slot.generator.active_handles.return_value = (MagicMock(uid=7),)
+        req = GenerateRequest([1, 2, 3], "rust", 16, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        engine._uid_to_request[("rust", 7)] = req
+
+        state, token_slot_ids = engine._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
+
+        assert token_slot_ids == (1,)
+        assert state.get("layers.0.q_proj") is not None
+
     def test_decode_row_bindings_follow_scheduler_and_generator_order(self):
         engine = _make_engine()
         rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1, 2})

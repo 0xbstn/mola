@@ -130,6 +130,9 @@ class MultiLoRALinear(nn.Module):
     def _routed_delta(self, x: mx.array) -> mx.array | None:
         if self.layer_name is None:
             return None
+        slot_id = get_current_slot_id()
+        if slot_id is not None and slot_id not in self._adapters_by_slot:
+            return None
         routed_session = get_current_routed_decode_session()
         if routed_session is None:
             return None
