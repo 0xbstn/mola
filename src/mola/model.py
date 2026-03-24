@@ -112,6 +112,13 @@ class MOLAModel:
             if isinstance(module, (MultiLoRALinear, MultiLoRASwitchLinear)) and module.slot_ids:
                 yield name, module
 
+    def iter_routed_decode_lora_layers(self):
+        from mola.lora import MultiLoRALinear
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, MultiLoRALinear) and module.slot_ids:
+                yield name, module
+
     def adapter_slot_id(self, adapter_id: str | None) -> int | None:
         return self.adapter_manager.slot_id(adapter_id)
 

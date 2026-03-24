@@ -40,12 +40,18 @@ def main(verbose: bool):
     type=int,
     help="Global in-flight token budget for admission control",
 )
+@click.option(
+    "--enable-routed-decode-reference",
+    is_flag=True,
+    help="Enable the experimental homogeneous routed-decode reference path",
+)
 def serve(
     model: str,
     adapter: tuple,
     host: str,
     port: int,
     max_inflight_tokens: int,
+    enable_routed_decode_reference: bool,
 ):
     """Start the MOLA inference server."""
     import uvicorn
@@ -61,12 +67,16 @@ def serve(
 
     app = create_app(
         mola_model,
-        EngineConfig(max_inflight_tokens=max_inflight_tokens),
+        EngineConfig(
+            max_inflight_tokens=max_inflight_tokens,
+            enable_routed_decode_reference=enable_routed_decode_reference,
+        ),
     )
 
     click.echo(f"MOLA serving on http://{host}:{port}")
     click.echo(f"  Base model: {model}")
     click.echo(f"  Adapters: {[name for name, _ in adapter] or ['none']}")
+    click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
     click.echo()
     click.echo("Endpoints:")
     click.echo(f"  POST   http://{host}:{port}/v1/chat/completions")

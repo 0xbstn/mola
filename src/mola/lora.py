@@ -22,7 +22,8 @@ import logging
 import mlx.core as mx
 import mlx.nn as nn
 
-from mola.context import get_current_adapter, get_current_slot_id
+from mola.application.packing import routed_decode_delta_rows_reference
+from mola.context import get_current_adapter, get_current_routed_pack_state, get_current_slot_id, get_current_token_slot_ids
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +36,10 @@ class MultiLoRALinear(nn.Module):
     and applies its delta if present.
     """
 
-    def __init__(self, base_linear: nn.Module):
+    def __init__(self, base_linear: nn.Module, layer_name: str | None = None):
         super().__init__()
         self.linear = base_linear
+        self.layer_name = layer_name
         self._adapters: dict[str, tuple[mx.array, mx.array, float]] = {}
         self._adapters_by_slot: dict[int, tuple[mx.array, mx.array, float]] = {}
         self._slot_by_adapter: dict[str, int] = {}
@@ -126,14 +128,52 @@ class MultiLoRALinear(nn.Module):
             return None
         return self._adapters.get(adapter_id)
 
+    def _routed_delta(self, x: mx.array) -> mx.array | None:
+        if self.layer_name is None:
+            return None
+        layer_pack_state = get_current_routed_pack_state()
+        token_slot_ids = get_current_token_slot_ids()
+        if layer_pack_state is None or token_slot_ids is None:
+            return None
+        pack = layer_pack_state.get(self.layer_name)
+        if pack is None:
+            return None
+        if not token_slot_ids:
+            return None
+        if not x.shape:
+            return None
+
+        row_count = 1
+        for dim in x.shape[:-1]:
+            row_count *= dim
+        if row_count != len(token_slot_ids):
+            return None
+
+        try:
+            return routed_decode_delta_rows_reference(
+                x,
+                pack,
+                token_slot_ids,
+                flatten_fn=lambda array: (array.reshape((-1, array.shape[-1])), tuple(array.shape)),
+                restore_fn=lambda array, shape: array.reshape(shape[:-1] + (array.shape[-1],)),
+                take_rows_fn=lambda array, rows: array[mx.array(rows)],
+                concat_fn=lambda chunks: mx.concatenate(chunks, axis=0),
+            )
+        except ValueError:
+            return None
+
     def __call__(self, x: mx.array) -> mx.array:
         y = self.linear(x)
 
-        binding = self._active_binding()
-        if binding is not None:
-            lora_a, lora_b, scale = binding
-            delta = (x @ lora_a) @ lora_b
-            y = y + (scale * delta).astype(y.dtype)
+        delta = self._routed_delta(x)
+        if delta is None:
+            binding = self._active_binding()
+            if binding is not None:
+                lora_a, lora_b, scale = binding
+                delta = scale * ((x @ lora_a) @ lora_b)
+
+        if delta is not None:
+            y = y + delta.astype(y.dtype)
 
         return y
 
@@ -145,9 +185,10 @@ class MultiLoRASwitchLinear(nn.Module):
     Handles the case where LoRA targets individual experts in a MoE layer.
     """
 
-    def __init__(self, base_linear: nn.Module):
+    def __init__(self, base_linear: nn.Module, layer_name: str | None = None):
         super().__init__()
         self.linear = base_linear
+        self.layer_name = layer_name
         self._adapters: dict[str, tuple[mx.array, mx.array, float]] = {}
         self._adapters_by_slot: dict[int, tuple[mx.array, mx.array, float]] = {}
         self._slot_by_adapter: dict[str, int] = {}
@@ -241,7 +282,7 @@ def apply_multi_lora(model: nn.Module, target_modules: list[str] | None = None):
     for name, module in model.named_modules():
         if any(name.endswith(target) for target in target_modules):
             if isinstance(module, (nn.Linear, nn.QuantizedLinear)):
-                replacements.append((name, MultiLoRALinear(module)))
+                replacements.append((name, MultiLoRALinear(module, layer_name=name)))
             # TODO: handle SwitchLinear for MoE expert LoRA
 
     if replacements:

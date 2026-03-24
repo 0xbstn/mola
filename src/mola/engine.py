@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from mola.adapter import AdapterSlotBinding
-from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, build_layer_slot_pack_views, materialize_layer_slot_packs
+from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, RoutedLayerPackState, build_layer_slot_pack_state, build_layer_slot_pack_views, materialize_layer_slot_packs
 from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPolicy
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
-from mola.context import adapter_context
+from mola.context import adapter_context, routed_decode_context
 from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
 
 if TYPE_CHECKING:
@@ -43,6 +43,7 @@ class EngineConfig:
     max_inflight_tokens: int = 32768
     prefill_interval: int = 2
     prefill_slot_limit: int = 1
+    enable_routed_decode_reference: bool = False
 
 
 @dataclass
@@ -110,6 +111,7 @@ class EngineMetrics:
     token_budget_limit: int = 0
     total_step_lock_wait_ms: float = 0.0
     total_insert_lock_wait_ms: float = 0.0
+    routed_decode_reference_enabled: bool = False
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -133,6 +135,7 @@ class EngineMetrics:
             "token_budget_limit": self.token_budget_limit,
             "total_step_lock_wait_ms": round(self.total_step_lock_wait_ms, 2),
             "total_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms, 2),
+            "routed_decode_reference_enabled": self.routed_decode_reference_enabled,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -197,6 +200,9 @@ class MOLAEngine:
         self.config = config or EngineConfig()
         self.metrics = EngineMetrics()
         self.metrics.token_budget_limit = self.config.max_inflight_tokens
+        self.metrics.routed_decode_reference_enabled = (
+            self.config.enable_routed_decode_reference
+        )
         self.admission_policy = TokenBudgetAdmissionPolicy(self.config.max_inflight_tokens)
         self.scheduling_policy: WaitingAwareSchedulingPolicy[str | None] = (
             WaitingAwareSchedulingPolicy()
@@ -382,13 +388,113 @@ class MOLAEngine:
             iter_layers(),
         )
 
+    def routed_layer_slot_pack_views(self) -> tuple[LayerSlotPackView, ...]:
+        iter_layers = getattr(self.mola_model, "iter_routed_decode_lora_layers", None)
+        if callable(iter_layers):
+            return build_layer_slot_pack_views(
+                self.active_slot_bindings(),
+                iter_layers(),
+            )
+        return self.layer_slot_pack_views()
+
     def materialize_layer_slot_packs(
         self,
         stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
     ) -> tuple[MaterializedLayerSlotPack, ...]:
         return materialize_layer_slot_packs(
             self.layer_slot_pack_views(),
             stack_fn=stack_fn,
+            scale_fn=scale_fn,
+        )
+
+    def materialize_routed_layer_slot_packs(
+        self,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> tuple[MaterializedLayerSlotPack, ...]:
+        return materialize_layer_slot_packs(
+            self.routed_layer_slot_pack_views(),
+            stack_fn=stack_fn,
+            scale_fn=scale_fn,
+        )
+
+    def materialize_layer_slot_pack_state(
+        self,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> RoutedLayerPackState:
+        return build_layer_slot_pack_state(
+            self.materialize_routed_layer_slot_packs(
+                stack_fn=stack_fn,
+                scale_fn=scale_fn,
+            )
+        )
+
+    def build_routed_decode_context(
+        self,
+        token_slot_ids: list[int] | tuple[int, ...],
+        *,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+        return (
+            self.materialize_layer_slot_pack_state(
+                stack_fn=stack_fn,
+                scale_fn=scale_fn,
+            ),
+            tuple(token_slot_ids),
+        )
+
+    def build_homogeneous_decode_context(
+        self,
+        adapter_id: str | None,
+        token_count: int,
+        *,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+        runtime_slot_id = self._adapter_slot_id(adapter_id)
+        token_slot_ids = () if runtime_slot_id is None else (runtime_slot_id,) * token_count
+        return self.build_routed_decode_context(
+            token_slot_ids,
+            stack_fn=stack_fn,
+            scale_fn=scale_fn,
+        )
+
+    def _build_homogeneous_decode_routed_context_for_slot(
+        self,
+        slot: _AdapterSlot,
+        *,
+        stack_fn: Callable[[list[Any]], Any],
+        scale_fn: Callable[[list[float]], Any] | None = None,
+    ) -> tuple[RoutedLayerPackState | None, tuple[int, ...] | None]:
+        with self._state_lock:
+            active_count = len(slot.active_uids)
+        if active_count <= 0:
+            return None, None
+        runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
+        if runtime_slot_id is None:
+            return None, None
+        return self.build_homogeneous_decode_context(
+            slot.adapter_id,
+            active_count,
+            stack_fn=stack_fn,
+            scale_fn=scale_fn,
+        )
+
+    def _maybe_build_homogeneous_decode_routed_context_for_slot_locked(
+        self,
+        slot: _AdapterSlot,
+    ) -> tuple[RoutedLayerPackState | None, tuple[int, ...] | None]:
+        if not self.config.enable_routed_decode_reference:
+            return None, None
+        import mlx.core as mx
+
+        return self._build_homogeneous_decode_routed_context_for_slot(
+            slot,
+            stack_fn=lambda values: mx.stack(values, axis=0),
+            scale_fn=lambda values: mx.array(values),
         )
 
     def _adapter_slot_id(self, adapter_id: str | None) -> int | None:
@@ -685,18 +791,22 @@ class MOLAEngine:
         lock_wait_start = time.monotonic()
         with self.model_lock:
             lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
+            routed_pack_state, token_slot_ids = (
+                self._maybe_build_homogeneous_decode_routed_context_for_slot_locked(slot)
+            )
             t0 = time.monotonic()
             with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
-                try:
-                    responses = slot.generator.step()
-                except StopIteration:
-                    return
-                except Exception:
-                    logger.exception(
-                        f"BatchGenerator error for adapter '{slot.adapter_id}'"
-                    )
-                    self._fail_slot(slot, "internal error")
-                    return
+                with routed_decode_context(routed_pack_state, token_slot_ids):
+                    try:
+                        responses = slot.generator.step()
+                    except StopIteration:
+                        return
+                    except Exception:
+                        logger.exception(
+                            f"BatchGenerator error for adapter '{slot.adapter_id}'"
+                        )
+                        self._fail_slot(slot, "internal error")
+                        return
         step_ms = (time.monotonic() - t0) * 1000
 
         finished_uids = set()
