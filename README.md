@@ -216,7 +216,7 @@ Train adapters with [mlx-lm](https://github.com/ml-explore/mlx-lm), [mlx-tune](h
 - Apple Silicon Mac (M1 or later)
 - Python 3.11+
 - macOS 13+
-- MLX 0.22+
+- MLX 0.25+ / mlx-lm 0.25+ (tested on 0.31.1)
 
 ## Memory usage
 

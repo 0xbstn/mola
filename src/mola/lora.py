@@ -42,13 +42,11 @@ class MultiLoRALinear(nn.Module):
         self._adapters: dict[str, tuple[mx.array, mx.array, float]] = {}
 
     def add_adapter(self, name: str, lora_a: mx.array, lora_b: mx.array, scale: float):
-        # Validate rank consistency between A and B
         if lora_a.shape[1] != lora_b.shape[0]:
             raise ValueError(
                 f"LoRA rank mismatch for adapter '{name}': "
                 f"lora_a {tuple(lora_a.shape)} vs lora_b {tuple(lora_b.shape)}"
             )
-        # Validate dimensions against the base linear layer
         in_features, out_features = self._base_dims()
         if in_features is not None:
             if lora_a.shape[0] != in_features:
@@ -66,10 +64,13 @@ class MultiLoRALinear(nn.Module):
     def _base_dims(self) -> tuple[int | None, int | None]:
         """Extract (input_dims, output_dims) from the wrapped linear layer."""
         base = self.linear
-        # QuantizedLinear stores dims explicitly
         if hasattr(base, "input_dims") and hasattr(base, "output_dims"):
             return base.input_dims, base.output_dims
-        # nn.Linear: weight is [out, in]
+        # Quantized weights are packed: shape[1] = real_in * bits / 32
+        if hasattr(base, "bits") and hasattr(base, "weight") and base.weight.ndim == 2:
+            out_features = base.weight.shape[0]
+            in_features = base.weight.shape[1] * 32 // base.bits
+            return in_features, out_features
         if hasattr(base, "weight") and base.weight.ndim == 2:
             return base.weight.shape[1], base.weight.shape[0]
         return None, None

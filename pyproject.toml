@@ -9,8 +9,8 @@ description = "Multi-adapter Orchestration LoRA Apple — Multi-LoRA serving for
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "mlx>=0.22",
-    "mlx-lm>=0.20",
+    "mlx>=0.25",
+    "mlx-lm>=0.25",
     "fastapi>=0.100",
     "uvicorn[standard]>=0.20",
     "click>=8.0",

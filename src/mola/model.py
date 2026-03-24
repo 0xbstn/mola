@@ -55,7 +55,7 @@ class MOLAModel:
             )
         adapter = self.adapter_manager.load(name, path)
 
-        needed = set(adapter.config.target_modules)
+        needed = set(adapter.config.target_modules or [])
         new_modules = needed - self._wrapped_modules
         if new_modules:
             if self._wrapped_modules:
@@ -67,6 +67,11 @@ class MOLAModel:
             self._wrapped_modules |= new_modules
 
         expected = len(adapter.weights.weights)
+        if expected == 0:
+            self.adapter_manager.unload(name)
+            raise RuntimeError(
+                f"Adapter '{name}': no valid LoRA weight pairs found in safetensors"
+            )
         try:
             injected = inject_adapter_weights(
                 self.model,
@@ -75,7 +80,7 @@ class MOLAModel:
                 scale=adapter.config.scale,
             )
         except Exception:
-            # Shape mismatch or other error mid-injection — rollback partial state
+            # Rollback: some layers may already have the adapter injected
             eject_adapter_weights(self.model, name)
             self.adapter_manager.unload(name)
             raise
@@ -95,6 +100,13 @@ class MOLAModel:
     def list_adapters(self) -> list[dict]:
         return self.adapter_manager.list_adapters()
 
+    @staticmethod
+    def _make_sampler(temp: float, top_p: float):
+        """Build an mlx-lm sampler from temperature and top_p."""
+        from mlx_lm.sample_utils import make_sampler
+
+        return make_sampler(temp=temp, top_p=top_p)
+
     def generate(
         self,
         prompt: str,
@@ -104,14 +116,14 @@ class MOLAModel:
         top_p: float = 0.9,
     ) -> str:
         """Generate text with an optional adapter."""
+        sampler = self._make_sampler(temp, top_p)
         with adapter_context(adapter_id):
             response = mlx_lm.generate(
                 self.model,
                 self.tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
-                temp=temp,
-                top_p=top_p,
+                sampler=sampler,
             )
         return response
 
@@ -124,13 +136,13 @@ class MOLAModel:
         top_p: float = 0.9,
     ):
         """Yield tokens one by one for streaming. Used by the server."""
+        sampler = self._make_sampler(temp, top_p)
         with adapter_context(adapter_id):
             for step in mlx_lm.stream_generate(
                 self.model,
                 self.tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
-                temp=temp,
-                top_p=top_p,
+                sampler=sampler,
             ):
                 yield step

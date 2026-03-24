@@ -27,7 +27,7 @@ class AdapterConfig:
     scale: float
     dropout: float
     num_layers: int
-    target_modules: list[str]
+    target_modules: list[str] | None
     fine_tune_type: str = "lora"
 
     @classmethod
@@ -41,9 +41,7 @@ class AdapterConfig:
             scale=lora_params.get("scale", 20.0),
             dropout=lora_params.get("dropout", 0.0),
             num_layers=raw.get("num_layers", 16),
-            target_modules=lora_params.get(
-                "keys", ["self_attn.q_proj", "self_attn.v_proj"]
-            ),
+            target_modules=lora_params.get("keys", None),
             fine_tune_type=raw.get("fine_tune_type", "lora"),
         )
 
@@ -145,8 +143,10 @@ class AdapterManager:
         """Load lora_a/lora_b weight pairs from safetensors.
 
         mlx-lm saves adapter weights with keys like:
-            layers.16.self_attn.q_proj.lora_a  -> shape [input_dims, rank]
-            layers.16.self_attn.q_proj.lora_b  -> shape [rank, output_dims]
+            model.layers.16.self_attn.q_proj.lora_a  -> shape [input_dims, rank]
+            model.layers.16.self_attn.q_proj.lora_b  -> shape [rank, output_dims]
+
+        Also derives target_modules from weight keys when not in config.
         """
         safetensors_path = adapter_path / "adapters.safetensors"
         raw_weights = mx.load(str(safetensors_path))
@@ -159,5 +159,18 @@ class AdapterManager:
                 b_key = layer_path + ".lora_b"
                 if b_key in raw_weights:
                     paired[layer_path] = (tensor, raw_weights[b_key])
+
+        # Derive target_modules from weight keys when config doesn't specify
+        if config.target_modules is None and paired:
+            import re
+            suffixes = set()
+            for layer_path in paired:
+                # Strip "model.layers.N." prefix → "self_attn.q_proj"
+                match = re.sub(r"^(model\.)?layers\.\d+\.", "", layer_path)
+                suffixes.add(match)
+            config.target_modules = sorted(suffixes)
+            logger.info(
+                f"Derived target_modules from weights: {config.target_modules}"
+            )
 
         return AdapterWeights(weights=paired)

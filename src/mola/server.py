@@ -81,16 +81,13 @@ def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
 
     Raises ValueError for anything that doesn't resolve.
     """
-    # 1. Reserved base model keyword
     if model_field == BASE_MODEL_SELECTOR:
         return None
-    # 2. Direct adapter name match
     if mola_model.adapter_manager.get(model_field) is not None:
         return model_field
-    # 3. Exact base model path — clients can use the value from /health
     if model_field == mola_model.model_path:
         return None
-    # 4. base/adapter pattern — suffix must be a known adapter
+    # Slash pattern: only the suffix matters (prefix is not validated)
     if "/" in model_field:
         _, candidate = model_field.rsplit("/", 1)
         if mola_model.adapter_manager.get(candidate) is not None:
@@ -101,7 +98,7 @@ def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
             f"Valid base model selectors: '{BASE_MODEL_SELECTOR}' "
             f"or '{mola_model.model_path}'."
         )
-    # 5. Unknown bare name — not an adapter, not base → error
+    # No match at all — reject to catch typos
     adapters = [a["name"] for a in mola_model.list_adapters()]
     valid = [f"'{BASE_MODEL_SELECTOR}' (base model)"]
     valid += [f"'{n}' (adapter)" for n in adapters]
@@ -246,6 +243,19 @@ def create_app(mola_model: MOLAModel) -> FastAPI:
             except KeyError:
                 raise HTTPException(404, f"Adapter '{name}' not loaded")
         return {"status": "unloaded", "name": name}
+
+    @app.get("/v1/models")
+    async def list_models():
+        """OpenAI-compatible model listing. Needed for clients like Msty."""
+        models = [
+            {"id": BASE_MODEL_SELECTOR, "object": "model", "owned_by": "mola"},
+            {"id": mola_model.model_path, "object": "model", "owned_by": "mola"},
+        ]
+        for adapter in mola_model.list_adapters():
+            models.append(
+                {"id": adapter["name"], "object": "model", "owned_by": "mola"}
+            )
+        return {"object": "list", "data": models}
 
     @app.get("/health")
     async def health():
