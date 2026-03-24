@@ -386,6 +386,27 @@ class MOLAEngine:
             key=lambda binding: binding.slot_id,
         ))
 
+    def slot_bindings_for_slot_ids(
+        self,
+        slot_ids: list[int] | tuple[int, ...] | set[int],
+    ) -> tuple[AdapterSlotBinding, ...]:
+        bindings = getattr(self.mola_model, "adapter_slot_bindings", None)
+        if not callable(bindings):
+            return ()
+        slot_ids = set(slot_ids)
+        if not slot_ids:
+            return ()
+        return tuple(
+            sorted(
+                (binding for binding in bindings() if binding.slot_id in slot_ids),
+                key=lambda binding: binding.slot_id,
+            )
+        )
+
+    def decode_active_slot_bindings(self) -> tuple[AdapterSlotBinding, ...]:
+        active_slot_ids = {binding.slot_id for binding in self.decode_row_bindings()}
+        return self.slot_bindings_for_slot_ids(active_slot_ids)
+
     def layer_slot_pack_views(self) -> tuple[LayerSlotPackView, ...]:
         iter_layers = getattr(self.mola_model, "iter_slot_bound_lora_layers", None)
         if not callable(iter_layers):
@@ -395,11 +416,21 @@ class MOLAEngine:
             iter_layers(),
         )
 
-    def routed_layer_slot_pack_views(self) -> tuple[LayerSlotPackView, ...]:
+    def routed_layer_slot_pack_views(
+        self,
+        token_slot_ids: list[int] | tuple[int, ...] | None = None,
+    ) -> tuple[LayerSlotPackView, ...]:
         iter_layers = getattr(self.mola_model, "iter_routed_decode_lora_layers", None)
+        active_bindings = (
+            self.decode_active_slot_bindings()
+            if token_slot_ids is None
+            else self.slot_bindings_for_slot_ids(token_slot_ids)
+        )
+        if not active_bindings:
+            return ()
         if callable(iter_layers):
             return build_layer_slot_pack_views(
-                self.active_slot_bindings(),
+                active_bindings,
                 iter_layers(),
             )
         return self.layer_slot_pack_views()
@@ -419,9 +450,10 @@ class MOLAEngine:
         self,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
+        token_slot_ids: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[MaterializedLayerSlotPack, ...]:
         return materialize_layer_slot_packs(
-            self.routed_layer_slot_pack_views(),
+            self.routed_layer_slot_pack_views(token_slot_ids=token_slot_ids),
             stack_fn=stack_fn,
             scale_fn=scale_fn,
         )
@@ -430,11 +462,13 @@ class MOLAEngine:
         self,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
+        token_slot_ids: list[int] | tuple[int, ...] | None = None,
     ) -> RoutedLayerPackState:
         return build_layer_slot_pack_state(
             self.materialize_routed_layer_slot_packs(
                 stack_fn=stack_fn,
                 scale_fn=scale_fn,
+                token_slot_ids=token_slot_ids,
             )
         )
 
@@ -445,12 +479,14 @@ class MOLAEngine:
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
     ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+        token_slot_ids = tuple(token_slot_ids)
         return (
             self.materialize_layer_slot_pack_state(
                 stack_fn=stack_fn,
                 scale_fn=scale_fn,
+                token_slot_ids=token_slot_ids,
             ),
-            tuple(token_slot_ids),
+            token_slot_ids,
         )
 
     def decode_row_bindings(self) -> tuple[DecodeRowBinding, ...]:
@@ -659,7 +695,10 @@ class MOLAEngine:
             with self._state_lock:
                 req = self._uid_to_request.pop((adapter_id, uid), None)
                 if req:
-                    self._release_budget_locked(req)
+                    self._send_to_queue(req, {"error": "internal error"})
+                    self._send_to_queue(req, None)
+                    with self._state_lock:
+                        self._release_budget_locked(req)
                 if slot and not slot.active_uids and not slot.pending_requests:
                     slot.service_debt = 0.0
                 self._update_sequence_count_locked()

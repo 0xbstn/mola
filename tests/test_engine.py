@@ -298,6 +298,25 @@ class TestAdapterSlotResolution:
             AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
         )
 
+    def test_decode_active_slot_bindings_use_only_decode_rows(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+            AdapterSlotBinding("legal", 3, 8, 16.0, 1, ("q_proj",), "/fake/legal"),
+        ]
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1})
+        rust_slot.generator.active_handles.return_value = (MagicMock(uid=21),)
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql")
+        sql_slot.pending_requests.append(GenerateRequest([1], "sql", 10, None, asyncio.Queue()))
+        engine._generators = {"rust": rust_slot, "sql": sql_slot}
+        engine._ordered_slots = lambda: [rust_slot, sql_slot]
+        engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+
+        assert engine.decode_active_slot_bindings() == (
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+        )
+
     def test_layer_slot_pack_views_builds_from_runtime_and_model(self):
         engine = _make_engine()
         engine.mola_model.adapter_slot_bindings.return_value = [
@@ -405,6 +424,8 @@ class TestAdapterSlotResolution:
             "rust": _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1}),
             "sql": _AdapterSlot(generator=MagicMock(), adapter_id="sql", pending_requests=deque([GenerateRequest([1], "sql", 10, None, asyncio.Queue())])),
         }
+        engine._generators["rust"].generator.active_handles.return_value = (MagicMock(uid=21),)
+        engine._ordered_slots = lambda: [engine._generators["rust"], engine._generators["sql"]]
         engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
 
         state = engine.materialize_layer_slot_pack_state(
@@ -414,23 +435,56 @@ class TestAdapterSlotResolution:
 
         pack = state.get("layers.0.q_proj")
         assert pack is not None
-        assert pack.adapter_names == ("rust", "sql")
+        assert pack.adapter_names == ("rust",)
+        assert pack.slot_ids == (1,)
         assert state.get("layers.9.q_proj") is None
+
+    def test_build_routed_decode_context_filters_pack_state_to_explicit_slot_ids(self):
+        engine = _make_engine()
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
+        ]
+        engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
+            (
+                "layers.0.q_proj",
+                self._FakeLayer([
+                    (2, "a-sql", "b-sql", 20.0),
+                    (1, "a-rust", "b-rust", 16.0),
+                ]),
+            ),
+        ])
+
+        state, token_slot_ids = engine.build_routed_decode_context(
+            (2, 2, 2),
+            stack_fn=lambda values: tuple(values),
+            scale_fn=lambda values: tuple(values),
+        )
+
+        pack = state.get("layers.0.q_proj")
+        assert token_slot_ids == (2, 2, 2)
+        assert pack is not None
+        assert pack.adapter_names == ("sql",)
+        assert pack.slot_ids == (2,)
 
     def test_materialize_layer_slot_pack_state_uses_routed_layer_iterator(self):
         engine = _make_engine()
         engine.mola_model.adapter_slot_bindings.return_value = [
             AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+            AdapterSlotBinding("sql", 2, 8, 16.0, 1, ("q_proj",), "/fake/sql"),
         ]
         engine.mola_model.iter_slot_bound_lora_layers.return_value = iter([
             ("layers.9.q_proj", self._FakeLayer([(1, "a-other", "b-other", 16.0)])),
         ])
         engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
-            ("layers.0.q_proj", self._FakeLayer([(1, "a-rust", "b-rust", 16.0)])),
+            ("layers.0.q_proj", self._FakeLayer([(1, "a-rust", "b-rust", 16.0), (2, "a-sql", "b-sql", 20.0)])),
         ])
         engine._generators = {
             "rust": _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1}),
+            "sql": _AdapterSlot(generator=MagicMock(), adapter_id="sql", pending_requests=deque([GenerateRequest([1], "sql", 10, None, asyncio.Queue())])),
         }
+        engine._generators["rust"].generator.active_handles.return_value = (MagicMock(uid=21),)
+        engine._ordered_slots = lambda: [engine._generators["rust"], engine._generators["sql"]]
         engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1}.get(adapter_id)
 
         state = engine.materialize_layer_slot_pack_state(
@@ -439,6 +493,7 @@ class TestAdapterSlotResolution:
         )
 
         assert state.get("layers.0.q_proj") is not None
+        assert state.get("layers.0.q_proj").slot_ids == (1,)
         assert state.get("layers.9.q_proj") is None
 
     def test_build_routed_decode_context_preserves_token_slot_ids(self):
