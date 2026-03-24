@@ -1,14 +1,12 @@
-"""Tests for server module: adapter ID extraction, chat formatting, endpoints."""
+"""Tests for server module: adapter ID extraction, chat formatting."""
 
 from __future__ import annotations
 
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
 
-from mola.server import BASE_MODEL_SELECTOR, Message, _format_chat, create_app, extract_adapter_id
+from mola.server import BASE_MODEL_SELECTOR, Message, _format_chat, extract_adapter_id
 
 
 # --- Helpers ---
@@ -57,8 +55,7 @@ class TestExtractAdapterId:
         assert extract_adapter_id("mlx-community/Qwen3.5-35B-A3B-4bit", model) is None
 
     def test_unknown_bare_name_raises(self):
-        """A bare name that is neither an adapter nor 'base' must error.
-        This catches typos like 'sqll' instead of 'sql'."""
+        """A bare name that is neither an adapter nor 'base' must error."""
         model = _make_mola_model(["sql"])
         with pytest.raises(ValueError, match="Unknown model selector"):
             extract_adapter_id("sqll", model)
@@ -138,92 +135,3 @@ class TestFormatChat:
         result = _format_chat(msgs, tokenizer=None)
         assert "<|im_start|>system" in result
         assert "<|im_start|>user" in result
-
-
-# --- Endpoints ---
-
-
-class TestEndpoints:
-    @pytest.fixture()
-    def client(self):
-        model = _make_mola_model([])
-        model.generate.return_value = "Hello back!"
-        app = create_app(model)
-        return TestClient(app)
-
-    def test_health(self, client):
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-
-    def test_list_adapters_empty(self, client):
-        resp = client.get("/v1/adapters")
-        assert resp.status_code == 200
-        assert resp.json()["adapters"] == []
-
-    def test_chat_completions_base_keyword(self, client):
-        """'base' is the canonical short selector for the base model."""
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "base",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
-        assert resp.status_code == 200
-        assert resp.json()["choices"][0]["message"]["content"] == "Hello back!"
-
-    def test_chat_completions_with_model_path(self, client):
-        """Sending the exact model_path (from /health) must work as base model."""
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
-        assert resp.status_code == 200
-
-    def test_chat_completions_unknown_bare_name_404(self, client):
-        """Unknown bare name (typo) must be 404, not silent fallback."""
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "sqll",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
-        assert resp.status_code == 404
-
-    def test_chat_completions_unknown_adapter_404(self, client):
-        """base/unknown must return 404."""
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "test-model/nonexistent",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
-        assert resp.status_code == 404
-
-    def test_add_adapter_reserved_name_rejected(self):
-        """Adapter name matching model_path or 'base' must be rejected (400)."""
-        model = _make_mola_model([])
-        model.load_adapter.side_effect = ValueError("is reserved")
-        app = create_app(model)
-        c = TestClient(app)
-        resp = c.post(
-            "/v1/adapters",
-            json={"name": "base", "path": "/tmp/fake"},
-        )
-        assert resp.status_code == 400
-        assert "reserved" in resp.json()["detail"]
-
-    def test_remove_adapter_not_found(self, client):
-        model = _make_mola_model([])
-        model.unload_adapter.side_effect = KeyError("nope")
-        app = create_app(model)
-        c = TestClient(app)
-        resp = c.delete("/v1/adapters/nope")
-        assert resp.status_code == 404

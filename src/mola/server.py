@@ -1,17 +1,12 @@
 """OpenAI-compatible HTTP server with per-request adapter selection.
 
-API design follows OpenAI format with adapter selection via the model field:
-    "model": "base"              -> base model (reserved keyword)
-    "model": "mlx-community/..."  -> base model (exact model_path from /health)
-    "model": "code-assist"       -> "code-assist" adapter (direct name match)
-    "model": "qwen/code-assist"  -> "code-assist" adapter (base/adapter pattern)
-    "model": "qwen/typo"         -> 404 error ("typo" is not a loaded adapter)
-    "model": "sqll"              -> 404 error (unknown bare name = typo caught)
-
-Additional endpoints for adapter management:
-    GET    /v1/adapters              -> list loaded adapters
-    POST   /v1/adapters              -> hot-load a new adapter
-    DELETE /v1/adapters/{name}       -> unload an adapter
+The model field is a strict selector:
+    "base"              -> base model (reserved keyword)
+    "mlx-community/..."  -> base model (exact model_path from /health)
+    "code-assist"       -> adapter (direct name match)
+    "qwen/code-assist"  -> adapter (suffix-based, prefix ignored)
+    "qwen/typo"         -> 404
+    "sqll"              -> 404 (unknown bare name)
 """
 
 from __future__ import annotations
@@ -19,19 +14,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import time
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from mola.engine import EngineConfig, GenerateRequest, MOLAEngine
 from mola.model import MOLAModel
 
 logger = logging.getLogger(__name__)
 
-
-# --- Request/Response models ---
+BASE_MODEL_SELECTOR = "base"
 
 
 class Message(BaseModel):
@@ -53,33 +49,11 @@ class AddAdapterRequest(BaseModel):
     path: str
 
 
-# --- Adapter ID extraction ---
-
-
-BASE_MODEL_SELECTOR = "base"
-
-
 def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
-    """Extract adapter ID from the 'model' field in the request.
+    """Strict model selector. Raises ValueError for anything that doesn't resolve.
 
-    The model field is a strict selector. Every value must resolve
-    unambiguously — unknown names are errors, not silent fallbacks.
-
-    Valid values:
-        "base"                                  -> base model (reserved keyword)
-        "mlx-community/Qwen3.5-35B-A3B-4bit"   -> base model (exact model_path)
-        "code-assist"                           -> adapter (direct name)
-        "qwen/code-assist"                      -> adapter (suffix-based: only the
-                                                   part after the last "/" matters)
-        "anything/code-assist"                  -> same — prefix is ignored
-        "qwen/typo"                             -> 404 error
-        "sqll"                                  -> 404 error (typo caught)
-
-    The prefix in "prefix/adapter" is not validated — any prefix works as long
-    as the suffix is a loaded adapter name. This is intentional: clients can use
-    any convention they want for the prefix (model name, org, etc.).
-
-    Raises ValueError for anything that doesn't resolve.
+    The prefix in "prefix/adapter" is not validated — any prefix works
+    as long as the suffix is a loaded adapter name.
     """
     if model_field == BASE_MODEL_SELECTOR:
         return None
@@ -87,7 +61,6 @@ def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
         return model_field
     if model_field == mola_model.model_path:
         return None
-    # Slash pattern: only the suffix matters (prefix is not validated)
     if "/" in model_field:
         _, candidate = model_field.rsplit("/", 1)
         if mola_model.adapter_manager.get(candidate) is not None:
@@ -98,7 +71,6 @@ def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
             f"Valid base model selectors: '{BASE_MODEL_SELECTOR}' "
             f"or '{mola_model.model_path}'."
         )
-    # No match at all — reject to catch typos
     adapters = [a["name"] for a in mola_model.list_adapters()]
     valid = [f"'{BASE_MODEL_SELECTOR}' (base model)"]
     valid += [f"'{n}' (adapter)" for n in adapters]
@@ -109,55 +81,8 @@ def extract_adapter_id(model_field: str, mola_model: MOLAModel) -> str | None:
     )
 
 
-# --- SSE streaming ---
-
-
-async def generate_stream(
-    request: ChatRequest, adapter_id: str | None, mola_model: MOLAModel
-) -> AsyncGenerator[str, None]:
-    """Stream tokens as SSE events in OpenAI format."""
-    prompt = _format_chat(request.messages, tokenizer=mola_model.tokenizer)
-    request_id = f"chatcmpl-{int(time.time())}"
-
-    for step in mola_model.generate_step(
-        prompt,
-        adapter_id=adapter_id,
-        max_tokens=request.max_tokens,
-        temp=request.temperature,
-        top_p=request.top_p,
-    ):
-        chunk = {
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": step.text},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-
-    # Final chunk
-    final = {
-        "id": request_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    yield f"data: {json.dumps(final)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
 def _format_chat(messages: list[Message], tokenizer=None) -> str:
-    """Format chat messages into a prompt string.
-
-    Uses the tokenizer's chat template when available, falls back to ChatML.
-    """
+    """Use tokenizer's chat template when available, fall back to ChatML."""
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             return tokenizer.apply_chat_template(
@@ -166,8 +91,7 @@ def _format_chat(messages: list[Message], tokenizer=None) -> str:
                 add_generation_prompt=True,
             )
         except Exception:
-            pass  # fall through to ChatML
-
+            pass
     parts = []
     for msg in messages:
         parts.append(f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>")
@@ -175,51 +99,125 @@ def _format_chat(messages: list[Message], tokenizer=None) -> str:
     return "\n".join(parts)
 
 
-# --- App factory ---
+async def _stream_tokens(
+    engine: MOLAEngine,
+    response_queue: asyncio.Queue,
+    chat_request: ChatRequest,
+    tokenizer,
+    raw_request: Request,
+) -> AsyncGenerator[str, None]:
+    request_id = f"chatcmpl-{int(time.time())}"
+    tokens: list[int] = []
+    prev_text = ""
+
+    while True:
+        if await raw_request.is_disconnected():
+            engine.cancel(response_queue)
+            return
+        try:
+            data = await asyncio.wait_for(response_queue.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        if data is None:
+            break
+        if "error" in data:
+            yield f"data: {json.dumps({'error': data['error']})}\n\n"
+            return
+
+        tokens.append(data["token"])
+        full_text = tokenizer.decode(tokens)
+        new_text = full_text[len(prev_text):]
+        prev_text = full_text
+
+        if new_text:
+            chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": chat_request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": new_text},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+    yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': chat_request.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+    yield "data: [DONE]\n\n"
 
 
-def create_app(mola_model: MOLAModel) -> FastAPI:
-    app = FastAPI(title="MOLA", version="0.1.0")
-    _lock = asyncio.Lock()
+def create_app(
+    mola_model: MOLAModel, engine_config: EngineConfig | None = None
+) -> FastAPI:
+    app = FastAPI(title="MOLA", version="0.2.0")
+    engine = MOLAEngine(mola_model, engine_config)
+
+    @app.on_event("startup")
+    async def startup():
+        engine.start(asyncio.get_event_loop())
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        engine.stop()
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatRequest):
+    async def chat_completions(body: ChatRequest, request: Request):
         try:
-            adapter_id = extract_adapter_id(request.model, mola_model)
+            adapter_id = extract_adapter_id(body.model, mola_model)
         except ValueError as e:
             raise HTTPException(404, str(e))
 
-        if request.stream:
-            async def locked_stream():
-                async with _lock:
-                    async for chunk in generate_stream(request, adapter_id, mola_model):
-                        yield chunk
+        prompt = _format_chat(body.messages, tokenizer=mola_model.tokenizer)
+        prompt_tokens = mola_model.tokenizer.encode(prompt)
+        sampler = mola_model._make_sampler(body.temperature, body.top_p)
 
+        response_queue = asyncio.Queue(maxsize=engine.config.response_queue_size)
+        gen_request = GenerateRequest(
+            prompt_tokens=prompt_tokens,
+            adapter_id=adapter_id,
+            max_tokens=body.max_tokens,
+            sampler=sampler,
+            response_queue=response_queue,
+        )
+
+        try:
+            engine.submit(gen_request)
+        except queue.Full:
+            raise HTTPException(503, "Server overloaded, try again later")
+
+        if body.stream:
             return StreamingResponse(
-                locked_stream(),
+                _stream_tokens(engine, response_queue, body, mola_model.tokenizer, request),
                 media_type="text/event-stream",
             )
 
-        async with _lock:
-            result = mola_model.generate(
-                prompt=_format_chat(request.messages, tokenizer=mola_model.tokenizer),
-                adapter_id=adapter_id,
-                max_tokens=request.max_tokens,
-                temp=request.temperature,
-                top_p=request.top_p,
-            )
+        tokens: list[int] = []
+        while True:
+            if await request.is_disconnected():
+                engine.cancel(response_queue)
+                raise HTTPException(499, "Client disconnected")
+            try:
+                data = await asyncio.wait_for(response_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if data is None:
+                break
+            if "error" in data:
+                raise HTTPException(500, data["error"])
+            tokens.append(data["token"])
+
+        text = mola_model.tokenizer.decode(tokens)
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result},
-                    "finish_reason": "stop",
-                }
-            ],
+            "model": body.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
         }
 
     @app.get("/v1/adapters")
@@ -227,35 +225,42 @@ def create_app(mola_model: MOLAModel) -> FastAPI:
         return {"adapters": mola_model.list_adapters()}
 
     @app.post("/v1/adapters")
-    async def add_adapter(request: AddAdapterRequest):
-        async with _lock:
-            try:
-                mola_model.load_adapter(request.name, request.path)
-            except Exception as e:
-                raise HTTPException(400, str(e))
-        return {"status": "loaded", "name": request.name}
+    async def add_adapter(body: AddAdapterRequest):
+        def _do_load():
+            with engine.model_lock:
+                mola_model.load_adapter(body.name, body.path)
+
+        try:
+            await asyncio.to_thread(_do_load)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+        return {"status": "loaded", "name": body.name}
 
     @app.delete("/v1/adapters/{name}")
     async def remove_adapter(name: str):
-        async with _lock:
-            try:
+        def _do_unload():
+            with engine.model_lock:
                 mola_model.unload_adapter(name)
-            except KeyError:
-                raise HTTPException(404, f"Adapter '{name}' not loaded")
+
+        try:
+            await asyncio.to_thread(_do_unload)
+        except KeyError:
+            raise HTTPException(404, f"Adapter '{name}' not loaded")
         return {"status": "unloaded", "name": name}
 
     @app.get("/v1/models")
     async def list_models():
-        """OpenAI-compatible model listing. Needed for clients like Msty."""
         models = [
             {"id": BASE_MODEL_SELECTOR, "object": "model", "owned_by": "mola"},
             {"id": mola_model.model_path, "object": "model", "owned_by": "mola"},
         ]
         for adapter in mola_model.list_adapters():
-            models.append(
-                {"id": adapter["name"], "object": "model", "owned_by": "mola"}
-            )
+            models.append({"id": adapter["name"], "object": "model", "owned_by": "mola"})
         return {"object": "list", "data": models}
+
+    @app.get("/v1/engine/metrics")
+    async def engine_metrics():
+        return engine.metrics.snapshot()
 
     @app.get("/health")
     async def health():
