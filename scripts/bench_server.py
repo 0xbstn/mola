@@ -80,6 +80,7 @@ class ScenarioResult:
     engine_tok_s: float
     engine_step_lock_wait_ms: float
     engine_insert_lock_wait_ms: float
+    engine_routed_decode_reference_enabled: bool
     models: list[str]
 
 
@@ -326,6 +327,9 @@ async def _run_scenario(
         engine_tok_s=(token_delta / wall_s) if wall_s > 0 else 0.0,
         engine_step_lock_wait_ms=step_lock_wait_delta,
         engine_insert_lock_wait_ms=insert_lock_wait_delta,
+        engine_routed_decode_reference_enabled=bool(
+            after.get("routed_decode_reference_enabled", False)
+        ),
         models=models,
     )
 
