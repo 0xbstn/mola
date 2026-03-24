@@ -28,7 +28,7 @@ Switch between adapters: instant.
 Same-adapter requests: batched.
 ```
 
-> **Status:** Alpha. Core serving works, batching engine validated, API contract stable. Tested on mlx-lm 0.31.1.
+> **Status:** Alpha. Core serving works, same-adapter batching is healthy, and the API contract is stable enough for experimentation. Mixed-adapter decode is still the main performance ceiling. Tested on mlx-lm 0.31.1.
 
 ## Why
 
@@ -47,7 +47,8 @@ MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory unt
 - **Supports quantized models** -- works with 4-bit and 8-bit MLX models
 - **MoE base models supported** -- serves MoE models (Qwen3.5, DeepSeek, Mixtral) with attention-layer LoRA adapters
 - **Standard PEFT format** -- loads adapters trained with mlx-lm, mlx-tune, or any PEFT-compatible tool
-- **Engine metrics** -- TTFT, tok/s, queue depth, active sequences via `/v1/engine/metrics`
+- **Token-budget admission control** -- `--max-inflight-tokens` limits total in-flight work using `prompt_tokens + max_tokens`
+- **Engine metrics** -- TTFT, tok/s, queue depth, active sequences, and lock-wait counters via `/v1/engine/metrics`
 - **Backpressure** -- returns 503 when overloaded instead of queuing unboundedly
 - **Client disconnect handling** -- cancelled requests are removed from the engine
 
@@ -72,7 +73,7 @@ mola serve \
   --port 8000
 ```
 
-`--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request.
+`--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request. It matters under heavy prefill load and should be tuned against available unified memory.
 
 ### Query
 
@@ -197,6 +198,8 @@ Engine runtime metrics:
   "requests_rejected": 0,
   "inflight_tokens_reserved": 0,
   "token_budget_limit": 32768,
+  "total_step_lock_wait_ms": 0.04,
+  "total_insert_lock_wait_ms": 0.0,
   "avg_ttft_ms": 53.8,
   "avg_tps": 225.6
 }
@@ -208,15 +211,15 @@ Server health check with model and adapter count.
 
 ## Benchmarks
 
-Measured on Qwen2.5-0.5B-Instruct-4bit with rust + sql adapters (Apple Silicon):
+Light benchmark snapshot measured on Qwen2.5-0.5B-Instruct-4bit with rust + sql adapters (Apple Silicon):
 
-| Scenario | conc=1 | conc=8 |
+| Scenario | conc=8 | conc=16 |
 |---|---|---|
-| Base model | 7.5 req/s, 481 tok/s | 21.7 req/s, 1388 tok/s |
-| Same adapter (rust) | 3.5 req/s, 226 tok/s | 13.6 req/s, 852 tok/s |
-| Mixed (rust+sql) | 3.5 req/s, 226 tok/s | 13.4 req/s, 542 tok/s |
+| Base | 21.4 req/s, 1368 tok/s, p95 375 ms | 26.3 req/s, 1681 tok/s, p95 610 ms |
+| Same adapter | 13.6 req/s, 786 tok/s, p95 597 ms | 18.1 req/s, 1048 tok/s, p95 889 ms |
+| Mixed | 4.8 req/s, 246 tok/s, p95 1724 ms | 7.0 req/s, 346 tok/s, p95 2334 ms |
 
-Same-adapter batching scales with concurrency. Mixed-adapter traffic is round-robined between per-adapter generators.
+Same-adapter batching scales well. Mixed-adapter traffic is correct and usable, but mixed decode remains the main throughput and latency ceiling.
 
 ## One-shot generation (no server)
 
@@ -266,15 +269,6 @@ Compare: loading 10 separate fine-tuned models would require ~180 GB.
 - **KV cache** -- switching adapters mid-conversation invalidates the KV cache. Each conversation should use one adapter throughout.
 - **Strict adapter validation** -- an adapter must inject into all its expected target layers. Partially compatible adapters are rejected at load time.
 - **No custom kernels** -- uses standard MLX matmul. Cross-adapter batching (S-LoRA style) would require a custom Metal kernel (BGMV equivalent).
-
-## Roadmap
-
-- [ ] HuggingFace Hub adapter loading (load by ID, not just local path)
-- [ ] Expert-layer LoRA for MoE models (SwitchLinear wrapping)
-- [ ] Cross-adapter batching via custom Metal kernel
-- [ ] DoRA adapter support
-- [ ] Per-adapter KV cache (avoid invalidation on switch)
-- [ ] Adapter merge strategies (TIES, DARE)
 
 ## Contributing
 
