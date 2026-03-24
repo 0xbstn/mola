@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mola"
+version = "0.1.0"
+description = "Multi-adapter Orchestration LoRA Apple — Multi-LoRA serving for MLX"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "mlx>=0.22",
+    "mlx-lm>=0.20",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "click>=8.0",
+    "huggingface-hub>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.24",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+mola = "mola.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
