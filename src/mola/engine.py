@@ -17,6 +17,7 @@ from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPo
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
 from mola.context import adapter_context, routed_decode_context
 from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
+from mola.ports.routed_decode import RoutedLoRADeltaSession
 
 if TYPE_CHECKING:
     from mola.model import MOLAModel
@@ -202,6 +203,7 @@ class MOLAEngine:
         mola_model: MOLAModel,
         config: EngineConfig | None = None,
         generator_factory: Callable[..., GeneratorPort] | None = None,
+        routed_decode_session_factory: Callable[[RoutedLayerPackState, tuple[int, ...]], RoutedLoRADeltaSession] | None = None,
     ):
         self.mola_model = mola_model
         self.config = config or EngineConfig()
@@ -215,6 +217,9 @@ class MOLAEngine:
             WaitingAwareSchedulingPolicy()
         )
         self._generator_factory = generator_factory or self._default_generator_factory
+        self._routed_decode_session_factory = (
+            routed_decode_session_factory or self._default_routed_decode_session_factory
+        )
         self.model_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
@@ -472,22 +477,20 @@ class MOLAEngine:
             )
         )
 
-    def build_routed_decode_context(
+    def build_routed_decode_session(
         self,
         token_slot_ids: list[int] | tuple[int, ...],
         *,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
-    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+    ) -> RoutedLoRADeltaSession:
         token_slot_ids = tuple(token_slot_ids)
-        return (
-            self.materialize_layer_slot_pack_state(
-                stack_fn=stack_fn,
-                scale_fn=scale_fn,
-                token_slot_ids=token_slot_ids,
-            ),
-            token_slot_ids,
+        pack_state = self.materialize_layer_slot_pack_state(
+            stack_fn=stack_fn,
+            scale_fn=scale_fn,
+            token_slot_ids=token_slot_ids,
         )
+        return self._routed_decode_session_factory(pack_state, token_slot_ids)
 
     def decode_row_bindings(self) -> tuple[DecodeRowBinding, ...]:
         bindings: list[DecodeRowBinding] = []
@@ -507,65 +510,65 @@ class MOLAEngine:
                 )
         return tuple(bindings)
 
-    def build_active_decode_context(
+    def build_active_decode_session(
         self,
         *,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
-    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+    ) -> RoutedLoRADeltaSession:
         row_bindings = self.decode_row_bindings()
         token_slot_ids = tuple(binding.slot_id for binding in row_bindings)
-        return self.build_routed_decode_context(
+        return self.build_routed_decode_session(
             token_slot_ids,
             stack_fn=stack_fn,
             scale_fn=scale_fn,
         )
 
-    def build_homogeneous_decode_context(
+    def build_homogeneous_decode_session(
         self,
         adapter_id: str | None,
         token_count: int,
         *,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
-    ) -> tuple[RoutedLayerPackState, tuple[int, ...]]:
+    ) -> RoutedLoRADeltaSession:
         runtime_slot_id = self._adapter_slot_id(adapter_id)
         token_slot_ids = () if runtime_slot_id is None else (runtime_slot_id,) * token_count
-        return self.build_routed_decode_context(
+        return self.build_routed_decode_session(
             token_slot_ids,
             stack_fn=stack_fn,
             scale_fn=scale_fn,
         )
 
-    def _build_homogeneous_decode_routed_context_for_slot(
+    def _build_homogeneous_decode_routed_session_for_slot(
         self,
         slot: _AdapterSlot,
         *,
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
-    ) -> tuple[RoutedLayerPackState | None, tuple[int, ...] | None]:
+    ) -> RoutedLoRADeltaSession | None:
         handles = slot.generator.active_handles()
         if not handles:
-            return None, None
+            return None
         runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
         if runtime_slot_id is None:
-            return None, None
-        return self.build_homogeneous_decode_context(
+            return None
+        return self.build_homogeneous_decode_session(
             slot.adapter_id,
             len(handles),
             stack_fn=stack_fn,
             scale_fn=scale_fn,
         )
 
-    def _maybe_build_homogeneous_decode_routed_context_for_slot_locked(
+    def _maybe_build_homogeneous_decode_routed_session_for_slot_locked(
         self,
         slot: _AdapterSlot,
-    ) -> tuple[RoutedLayerPackState | None, tuple[int, ...] | None]:
+    ) -> RoutedLoRADeltaSession | None:
         if not self.config.enable_routed_decode_reference:
-            return None, None
+            return None
         import mlx.core as mx
 
-        return self._build_homogeneous_decode_routed_context_for_slot(
+        return self._build_homogeneous_decode_routed_session_for_slot(
             slot,
             stack_fn=lambda values: mx.stack(values, axis=0),
             scale_fn=lambda values: mx.array(values),
@@ -821,6 +824,15 @@ class MOLAEngine:
 
         return MLXBatchGeneratorPort(*args, **kwargs)
 
+    def _default_routed_decode_session_factory(
+        self,
+        pack_state: RoutedLayerPackState,
+        token_slot_ids: tuple[int, ...],
+    ) -> RoutedLoRADeltaSession:
+        from mola.infrastructure.routed_decode import ReferenceRoutedLoRADeltaSession
+
+        return ReferenceRoutedLoRADeltaSession(pack_state, token_slot_ids)
+
     def _close_generator(self, slot: _AdapterSlot):
         try:
             slot.generator.close()
@@ -868,12 +880,10 @@ class MOLAEngine:
         lock_wait_start = time.monotonic()
         with self.model_lock:
             lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
-            routed_pack_state, token_slot_ids = (
-                self._maybe_build_homogeneous_decode_routed_context_for_slot_locked(slot)
-            )
+            routed_session = self._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
             t0 = time.monotonic()
             with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
-                with routed_decode_context(routed_pack_state, token_slot_ids):
+                with routed_decode_context(routed_session):
                     try:
                         responses = slot.generator.step()
                     except StopIteration:

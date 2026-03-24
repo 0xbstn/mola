@@ -22,8 +22,7 @@ import logging
 import mlx.core as mx
 import mlx.nn as nn
 
-from mola.application.packing import routed_decode_delta_rows_reference
-from mola.context import get_current_adapter, get_current_routed_pack_state, get_current_slot_id, get_current_token_slot_ids
+from mola.context import get_current_adapter, get_current_routed_decode_session, get_current_slot_id
 
 logger = logging.getLogger(__name__)
 
@@ -131,36 +130,10 @@ class MultiLoRALinear(nn.Module):
     def _routed_delta(self, x: mx.array) -> mx.array | None:
         if self.layer_name is None:
             return None
-        layer_pack_state = get_current_routed_pack_state()
-        token_slot_ids = get_current_token_slot_ids()
-        if layer_pack_state is None or token_slot_ids is None:
+        routed_session = get_current_routed_decode_session()
+        if routed_session is None:
             return None
-        pack = layer_pack_state.get(self.layer_name)
-        if pack is None:
-            return None
-        if not token_slot_ids:
-            return None
-        if not x.shape:
-            return None
-
-        row_count = 1
-        for dim in x.shape[:-1]:
-            row_count *= dim
-        if row_count != len(token_slot_ids):
-            return None
-
-        try:
-            return routed_decode_delta_rows_reference(
-                x,
-                pack,
-                token_slot_ids,
-                flatten_fn=lambda array: (array.reshape((-1, array.shape[-1])), tuple(array.shape)),
-                restore_fn=lambda array, shape: array.reshape(shape[:-1] + (array.shape[-1],)),
-                take_rows_fn=lambda array, rows: array[mx.array(rows)],
-                concat_fn=lambda chunks: mx.concatenate(chunks, axis=0),
-            )
-        except ValueError:
-            return None
+        return routed_session.delta(self.layer_name, x)
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.linear(x)
