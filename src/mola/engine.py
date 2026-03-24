@@ -394,6 +394,8 @@ class MOLAEngine:
     def slot_bindings_for_slot_ids(
         self,
         slot_ids: list[int] | tuple[int, ...] | set[int],
+        *,
+        strict: bool = False,
     ) -> tuple[AdapterSlotBinding, ...]:
         bindings = getattr(self.mola_model, "adapter_slot_bindings", None)
         if not callable(bindings):
@@ -401,12 +403,16 @@ class MOLAEngine:
         slot_ids = set(slot_ids)
         if not slot_ids:
             return ()
-        return tuple(
+        matched = tuple(
             sorted(
                 (binding for binding in bindings() if binding.slot_id in slot_ids),
                 key=lambda binding: binding.slot_id,
             )
         )
+        if strict and len(matched) != len(slot_ids):
+            missing_slot_ids = sorted(slot_ids - {binding.slot_id for binding in matched})
+            raise ValueError(f"missing adapter slot bindings for slot_ids={missing_slot_ids}")
+        return matched
 
     def decode_active_slot_bindings(self) -> tuple[AdapterSlotBinding, ...]:
         active_slot_ids = {binding.slot_id for binding in self.decode_row_bindings()}
@@ -429,7 +435,7 @@ class MOLAEngine:
         active_bindings = (
             self.decode_active_slot_bindings()
             if token_slot_ids is None
-            else self.slot_bindings_for_slot_ids(token_slot_ids)
+            else self.slot_bindings_for_slot_ids(token_slot_ids, strict=True)
         )
         if not active_bindings:
             return ()

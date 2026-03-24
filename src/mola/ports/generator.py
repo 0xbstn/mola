@@ -28,7 +28,8 @@ class GeneratorPort(Protocol):
         self, requests: Sequence[GeneratorSubmission]
     ) -> list[GeneratorHandle]: ...
 
-    def active_handles(self) -> tuple[GeneratorHandle, ...]: ...
+    def active_handles(self) -> tuple[GeneratorHandle, ...]:
+        """Return handles in the decode row order that the next step() will use."""
 
     def step(self) -> list[GenerationEvent]: ...
 

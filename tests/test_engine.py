@@ -474,6 +474,24 @@ class TestAdapterSlotResolution:
         assert pack.adapter_names == ("sql",)
         assert pack.slot_ids == (2,)
 
+    def test_build_routed_decode_session_rejects_unknown_explicit_slot_ids(self):
+        engine = _make_engine(
+            routed_decode_session_factory=lambda state, token_slot_ids: (state, token_slot_ids)
+        )
+        engine.mola_model.adapter_slot_bindings.return_value = [
+            AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
+        ]
+        engine.mola_model.iter_routed_decode_lora_layers.return_value = iter([
+            ("layers.0.q_proj", self._FakeLayer([(1, "a-rust", "b-rust", 16.0)])),
+        ])
+
+        with pytest.raises(ValueError, match="missing adapter slot bindings"):
+            engine.build_routed_decode_session(
+                (1, 2),
+                stack_fn=lambda values: tuple(values),
+                scale_fn=lambda values: tuple(values),
+            )
+
     def test_materialize_layer_slot_pack_state_uses_routed_layer_iterator(self):
         engine = _make_engine()
         engine.mola_model.adapter_slot_bindings.return_value = [
