@@ -32,6 +32,8 @@ class EngineConfig:
     idle_timeout: float = 60.0
     response_queue_size: int = 1024
     max_inflight_tokens: int = 32768
+    prefill_interval: int = 2
+    prefill_slot_limit: int = 1
 
 
 @dataclass
@@ -140,6 +142,7 @@ class _AdapterSlot:
     adapter_id: str | None
     active_uids: set[int] = field(default_factory=set)
     pending_requests: deque[GenerateRequest] = field(default_factory=deque)
+    service_debt: float = 0.0
     last_active: float = field(default_factory=time.time)
     last_service_ts: float = 0.0
     slot_metrics: SlotMetrics = field(default_factory=SlotMetrics)
@@ -277,6 +280,7 @@ class MOLAEngine:
                     "active_uids": len(slot.active_uids),
                     "batch_size": len(slot.active_uids),
                     "pending_requests": len(slot.pending_requests),
+                    "service_debt": round(slot.service_debt, 2),
                     "oldest_wait_ms": round(
                         max(0.0, now - slot.pending_requests[0].created_at) * 1000, 1
                     ) if slot.pending_requests else 0,
@@ -288,62 +292,40 @@ class MOLAEngine:
     def _run(self):
         cleanup_interval = 10.0
         last_cleanup = time.time()
+        iteration = 0
 
         while self._running:
+            iteration += 1
             self._drain_requests()
             self._process_cancelled()
+            with self._state_lock:
+                self._accrue_service_debt_locked()
 
             any_active = False
-            for slot in self._ordered_slots():
-                if self._insert_pending(slot):
-                    any_active = True
+            ordered_slots = self._ordered_slots()
+            decode_slots = [slot for slot in ordered_slots if slot.active_uids]
+            prefill_slots = [slot for slot in ordered_slots if slot.pending_requests]
 
-                with self._state_lock:
-                    active_count = len(slot.active_uids)
-                if not active_count:
-                    continue
-
+            for slot in decode_slots:
+                self._step_slot(slot)
                 any_active = True
-                logger.debug(
-                    f"slot_step_start adapter={slot.adapter_id} active={active_count}"
-                )
-                t0 = time.monotonic()
-                with self.model_lock:
-                    with adapter_context(slot.adapter_id):
-                        try:
-                            responses = slot.generator.step()
-                        except StopIteration:
-                            continue
-                        except Exception:
-                            logger.exception(
-                                f"BatchGenerator error for adapter '{slot.adapter_id}'"
-                            )
-                            self._fail_slot(slot, "internal error")
-                            continue
-                step_ms = (time.monotonic() - t0) * 1000
 
-                finished_uids = set()
-                resp_uids = []
-                resp_reasons = []
-                for resp in responses:
-                    resp_uids.append(resp.handle.uid)
-                    resp_reasons.append(resp.finish_reason)
-                    self._dispatch_token(
-                        slot.adapter_id, resp.handle.uid, resp.token, resp.finish_reason
-                    )
-                    if resp.finish_reason is not None:
-                        finished_uids.add(resp.handle.uid)
+            allow_prefill = self._should_run_prefill(
+                iteration=iteration,
+                has_decode=bool(decode_slots),
+            )
+            inserted_slots: list[_AdapterSlot] = []
+            if allow_prefill:
+                limit = self._prefill_limit(has_decode=bool(decode_slots))
+                for slot in prefill_slots[:limit]:
+                    if self._insert_pending(slot):
+                        inserted_slots.append(slot)
+                        any_active = True
 
-                with self._state_lock:
-                    slot.slot_metrics.record_step(step_ms, len(responses))
-                    slot.last_active = time.time()
-                    slot.last_service_ts = slot.last_active
-                    slot.active_uids -= finished_uids
-                    self._update_sequence_count_locked()
-                logger.debug(
-                    f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
-                    f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f}"
-                )
+            if not decode_slots:
+                for slot in inserted_slots:
+                    self._step_slot(slot)
+                    any_active = True
 
             now = time.time()
             if now - last_cleanup > cleanup_interval:
@@ -397,6 +379,8 @@ class MOLAEngine:
                         continue
                     kept.append(req)
                 slot.pending_requests = kept
+                if not slot.active_uids and not slot.pending_requests:
+                    slot.service_debt = 0.0
             to_remove = [
                 key for key, req in self._uid_to_request.items() if req.cancelled
             ]
@@ -421,6 +405,8 @@ class MOLAEngine:
                 req = self._uid_to_request.pop((adapter_id, uid), None)
                 if req:
                     self._release_budget_locked(req)
+                if slot and not slot.active_uids and not slot.pending_requests:
+                    slot.service_debt = 0.0
                 self._update_sequence_count_locked()
 
     def _dispatch_token(
@@ -510,6 +496,7 @@ class MOLAEngine:
                     self._release_budget_locked(req)
         with self._state_lock:
             slot.active_uids.clear()
+            slot.service_debt = 0.0
             self.metrics.queued_requests = self._queued_request_count_locked()
             self._update_sequence_count_locked()
 
@@ -573,6 +560,75 @@ class MOLAEngine:
             last_active_ts=slot.last_active,
             oldest_unstarted_ts=self._oldest_unstarted_ts_locked(slot),
         )
+
+    def _step_slot(self, slot: _AdapterSlot):
+        with self._state_lock:
+            active_count = len(slot.active_uids)
+        if not active_count:
+            return
+
+        logger.debug(
+            f"slot_step_start adapter={slot.adapter_id} active={active_count}"
+        )
+        t0 = time.monotonic()
+        with self.model_lock:
+            with adapter_context(slot.adapter_id):
+                try:
+                    responses = slot.generator.step()
+                except StopIteration:
+                    return
+                except Exception:
+                    logger.exception(
+                        f"BatchGenerator error for adapter '{slot.adapter_id}'"
+                    )
+                    self._fail_slot(slot, "internal error")
+                    return
+        step_ms = (time.monotonic() - t0) * 1000
+
+        finished_uids = set()
+        resp_uids = []
+        resp_reasons = []
+        for resp in responses:
+            resp_uids.append(resp.handle.uid)
+            resp_reasons.append(resp.finish_reason)
+            self._dispatch_token(
+                slot.adapter_id, resp.handle.uid, resp.token, resp.finish_reason
+            )
+            if resp.finish_reason is not None:
+                finished_uids.add(resp.handle.uid)
+
+        with self._state_lock:
+            slot.slot_metrics.record_step(step_ms, len(responses))
+            slot.service_debt = max(0.0, slot.service_debt - 1.0)
+            slot.last_active = time.time()
+            slot.last_service_ts = slot.last_active
+            slot.active_uids -= finished_uids
+            if not slot.active_uids and not slot.pending_requests:
+                slot.service_debt = 0.0
+            self._update_sequence_count_locked()
+        logger.debug(
+            f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
+            f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f}"
+        )
+
+    def _should_run_prefill(self, *, iteration: int, has_decode: bool) -> bool:
+        if not has_decode:
+            return True
+        return iteration % max(self.config.prefill_interval, 1) == 0
+
+    def _prefill_limit(self, *, has_decode: bool) -> int:
+        if not has_decode:
+            return self.config.max_batch_size
+        return max(1, self.config.prefill_slot_limit)
+
+    def _accrue_service_debt_locked(self):
+        for slot in self._generators.values():
+            if slot.active_uids:
+                slot.service_debt += 1.0
+                if self._oldest_unstarted_ts_locked(slot) is not None:
+                    slot.service_debt += 0.5
+            elif slot.pending_requests:
+                slot.service_debt += 0.25
 
     def _oldest_unstarted_ts_locked(self, slot: _AdapterSlot) -> float | None:
         candidates = [req.created_at for req in slot.pending_requests]

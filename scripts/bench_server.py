@@ -9,6 +9,7 @@ Examples:
     python scripts/bench_server.py
     python scripts/bench_server.py --concurrency 1,2,4,8,16 --repeats 3
     python scripts/bench_server.py --same-model rust --mixed-models rust,sql
+    python scripts/bench_server.py --extended --concurrency 4,8 --repeats 1
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ import httpx
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_BENCHMARK_VERSION = "0.3.1"
 
 PROMPTS = {
     "base": [
@@ -78,6 +81,14 @@ class ScenarioResult:
     models: list[str]
 
 
+@dataclass(frozen=True)
+class ScenarioSpec:
+    name: str
+    models: list[str]
+    prompt_mode: str = "default"
+    max_tokens: int | None = None
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -88,7 +99,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--same-model", default=None)
     parser.add_argument("--mixed-models", default=None)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="Include long-prefill, long-decode, and fairness scenarios",
+    )
+    parser.add_argument(
+        "--long-prefill-tokens",
+        type=int,
+        default=16,
+        help="Decode length for long-prefill scenarios",
+    )
+    parser.add_argument(
+        "--long-decode-tokens",
+        type=int,
+        default=256,
+        help="Decode length for long-decode scenarios",
+    )
     parser.add_argument("--json-out", default=None)
+    parser.add_argument(
+        "--save-version",
+        default=DEFAULT_BENCHMARK_VERSION,
+        help="Save results under benchmark/<version>/ when --json-out is not set",
+    )
     return parser.parse_args()
 
 
@@ -119,6 +152,35 @@ def _pick_prompt(model: str, index: int, base_model_path: str, adapter_names: se
     else:
         prompts = PROMPTS["default"]
     return prompts[index % len(prompts)]
+
+
+LONG_PREFILL_CONTEXT = "\n".join(
+    f"Reference paragraph {i}: caching, retries, observability, scheduling, and API ergonomics all interact in production systems."
+    for i in range(1, 65)
+)
+
+
+def _build_prompt(
+    model: str,
+    index: int,
+    base_model_path: str,
+    adapter_names: set[str],
+    prompt_mode: str,
+) -> str:
+    prompt = _pick_prompt(model, index, base_model_path, adapter_names)
+    if prompt_mode == "long_prefill":
+        return (
+            "Read the following background carefully before answering.\n\n"
+            f"{LONG_PREFILL_CONTEXT}\n\n"
+            f"Task: {prompt}\n"
+            "Keep the final answer concise."
+        )
+    if prompt_mode == "long_decode":
+        return (
+            f"{prompt}\n"
+            "Answer in a detailed, structured way with numbered steps, rationale, examples, and edge cases."
+        )
+    return prompt
 
 
 async def _get_json(client: httpx.AsyncClient, path: str) -> dict[str, Any]:
@@ -184,11 +246,18 @@ async def _run_wave(
     concurrency: int,
     max_tokens: int,
     wave_index: int,
+    prompt_mode: str = "default",
 ) -> list[RequestResult]:
     tasks = []
     for i in range(concurrency):
         model = models[i % len(models)]
-        prompt = _pick_prompt(model, wave_index * concurrency + i, base_model_path, adapter_names)
+        prompt = _build_prompt(
+            model,
+            wave_index * concurrency + i,
+            base_model_path,
+            adapter_names,
+            prompt_mode,
+        )
         tasks.append(_post_chat(client, base_url, model, prompt, max_tokens))
     return await asyncio.gather(*tasks)
 
@@ -204,6 +273,7 @@ async def _run_scenario(
     concurrency: int,
     repeats: int,
     max_tokens: int,
+    prompt_mode: str = "default",
 ) -> ScenarioResult:
     before = await _get_json(client, f"{base_url}/v1/engine/metrics")
     started = time.perf_counter()
@@ -220,6 +290,7 @@ async def _run_scenario(
                 concurrency,
                 max_tokens,
                 wave,
+                prompt_mode,
             )
         )
 
@@ -272,7 +343,76 @@ def _choose_mixed_models(
     return ["base", base_model_path]
 
 
-def _print_header(base_url: str, health: dict, adapters: list[dict], scenarios: dict[str, list[str]]):
+def _build_fairness_models(
+    adapter_names: list[str],
+    same_model: str,
+    base_model_path: str,
+) -> list[str]:
+    hot = same_model if same_model in adapter_names else (
+        adapter_names[0] if adapter_names else "base"
+    )
+    cold = [name for name in adapter_names if name != hot][:4]
+    if not cold:
+        cold = ["base"] if hot != "base" else [base_model_path]
+    return [hot, hot, hot, hot, *cold]
+
+
+def _build_scenarios(
+    *,
+    adapter_names: list[str],
+    base_model_path: str,
+    same_model: str,
+    mixed_models: list[str],
+    max_tokens: int,
+    extended: bool,
+    long_prefill_tokens: int,
+    long_decode_tokens: int,
+) -> list[ScenarioSpec]:
+    scenarios = [
+        ScenarioSpec("base", ["base"], max_tokens=max_tokens),
+        ScenarioSpec("same", [same_model], max_tokens=max_tokens),
+        ScenarioSpec("mixed", mixed_models, max_tokens=max_tokens),
+    ]
+    if not extended:
+        return scenarios
+
+    scenarios.extend(
+        [
+            ScenarioSpec(
+                "long-prefill-same",
+                [same_model],
+                prompt_mode="long_prefill",
+                max_tokens=min(max_tokens, long_prefill_tokens),
+            ),
+            ScenarioSpec(
+                "long-prefill-mixed",
+                mixed_models,
+                prompt_mode="long_prefill",
+                max_tokens=min(max_tokens, long_prefill_tokens),
+            ),
+            ScenarioSpec(
+                "long-decode-same",
+                [same_model],
+                prompt_mode="long_decode",
+                max_tokens=max(max_tokens, long_decode_tokens),
+            ),
+            ScenarioSpec(
+                "long-decode-mixed",
+                mixed_models,
+                prompt_mode="long_decode",
+                max_tokens=max(max_tokens, long_decode_tokens),
+            ),
+            ScenarioSpec(
+                "fairness",
+                _build_fairness_models(adapter_names, same_model, base_model_path),
+                max_tokens=max_tokens,
+            ),
+        ]
+    )
+    return scenarios
+
+
+def _print_header(base_url: str, health: dict, adapters: list[dict], scenarios: list[ScenarioSpec]):
     print("=" * 88)
     print("MOLA v2 Benchmark")
     print("=" * 88)
@@ -280,8 +420,11 @@ def _print_header(base_url: str, health: dict, adapters: list[dict], scenarios: 
     print(f"Model:    {health['model']}")
     print(f"Adapters: {', '.join(a['name'] for a in adapters) if adapters else '(none)'}")
     print("Scenarios:")
-    for name, models in scenarios.items():
-        print(f"  - {name}: {', '.join(models)}")
+    for scenario in scenarios:
+        suffix = ""
+        if scenario.prompt_mode != "default":
+            suffix = f" [{scenario.prompt_mode}]"
+        print(f"  - {scenario.name}: {', '.join(scenario.models)}{suffix}")
     print()
 
 
@@ -297,6 +440,11 @@ def _print_results(results: list[ScenarioResult]):
             f"{row.wall_s:>8.2f} {row.p50_ms:>8.1f} {row.p95_ms:>8.1f} "
             f"{row.req_s:>8.1f} {row.engine_tok_s:>8.1f} {row.errors:>5}"
         )
+
+
+def _default_output_path(version: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("benchmark") / version / f"bench-{timestamp}.json"
 
 
 async def main():
@@ -317,11 +465,16 @@ async def main():
             args.mixed_models,
             same_model,
         )
-        scenarios = {
-            "base": ["base"],
-            "same": [same_model],
-            "mixed": mixed_models,
-        }
+        scenarios = _build_scenarios(
+            adapter_names=adapter_names,
+            base_model_path=health["model"],
+            same_model=same_model,
+            mixed_models=mixed_models,
+            max_tokens=args.max_tokens,
+            extended=args.extended,
+            long_prefill_tokens=args.long_prefill_tokens,
+            long_decode_tokens=args.long_decode_tokens,
+        )
 
         _print_header(args.base_url, health, adapters, scenarios)
 
@@ -342,25 +495,31 @@ async def main():
 
         results: list[ScenarioResult] = []
         for concurrency in concurrency_levels:
-            for scenario, models in scenarios.items():
+            for scenario in scenarios:
                 results.append(
                     await _run_scenario(
                         client,
                         base_url=args.base_url,
-                        scenario=scenario,
-                        models=models,
+                        scenario=scenario.name,
+                        models=scenario.models,
                         base_model_path=health["model"],
                         adapter_names=adapter_name_set,
                         concurrency=concurrency,
                         repeats=args.repeats,
-                        max_tokens=args.max_tokens,
+                        max_tokens=scenario.max_tokens or args.max_tokens,
+                        prompt_mode=scenario.prompt_mode,
                     )
                 )
 
         _print_results(results)
 
+        output_path: Path | None = None
         if args.json_out:
             output_path = Path(args.json_out)
+        elif args.save_version:
+            output_path = _default_output_path(args.save_version)
+
+        if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
                 json.dumps([asdict(result) for result in results], indent=2)

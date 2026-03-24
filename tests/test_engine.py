@@ -282,6 +282,27 @@ class TestScheduling:
         ordered = engine._ordered_slots()
         assert [slot.adapter_id for slot in ordered] == ["sql", "rust"]
 
+    def test_accrues_service_debt_for_active_decode(self):
+        engine = _make_engine()
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={0})
+        engine._generators["rust"] = slot
+        engine._uid_to_request[("rust", 0)] = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+
+        with engine._state_lock:
+            engine._accrue_service_debt_locked()
+
+        assert slot.service_debt == 1.5
+
+    def test_prefill_runs_every_interval_when_decode_active(self):
+        engine = _make_engine(config=EngineConfig(prefill_interval=3))
+        assert engine._should_run_prefill(iteration=1, has_decode=True) is False
+        assert engine._should_run_prefill(iteration=2, has_decode=True) is False
+        assert engine._should_run_prefill(iteration=3, has_decode=True) is True
+
+    def test_prefill_always_runs_without_decode(self):
+        engine = _make_engine(config=EngineConfig(prefill_interval=99))
+        assert engine._should_run_prefill(iteration=1, has_decode=False) is True
+
     def test_completion_releases_token_budget(self):
         engine = _make_engine()
         req = GenerateRequest([1, 2], "rust", 10, None, asyncio.Queue())
