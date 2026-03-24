@@ -123,18 +123,21 @@ class MLXBatchGeneratorPort(GeneratorPort):
         Batch, merge_caches = _load_batch_state_symbols()
         import mlx.core as mx
 
-        incoming_uids = [state.handle.uid for state in states]
         existing_uids = set()
         if self._generator.active_batch is not None:
             existing_uids = set(self._generator.active_batch.uids)
-        duplicates = sorted(existing_uids.intersection(incoming_uids))
-        if duplicates:
-            raise ValueError(f"cannot restore duplicate active handle(s): {duplicates}")
+        next_uid = max(
+            getattr(self._generator, "uid_count", 0),
+            (max(existing_uids) + 1) if existing_uids else 0,
+        )
+        restored_handles = [
+            GeneratorHandle(uid=next_uid + index) for index in range(len(states))
+        ]
 
         token_dtype = getattr(states[0].tokens, "dtype", None)
         y_values = np.array([state.next_token for state in states], dtype=token_dtype)
         batch = Batch(
-            uids=incoming_uids,
+            uids=[handle.uid for handle in restored_handles],
             y=mx.array(y_values),
             logprobs=[state.logprobs for state in states],
             max_tokens=[state.max_tokens for state in states],
@@ -151,12 +154,9 @@ class MLXBatchGeneratorPort(GeneratorPort):
             self._generator.active_batch.extend(batch)
 
         if hasattr(self._generator, "uid_count"):
-            self._generator.uid_count = max(
-                self._generator.uid_count,
-                max(incoming_uids) + 1,
-            )
+            self._generator.uid_count = next_uid + len(states)
 
-        return [state.handle for state in states]
+        return restored_handles
 
     def close(self) -> None:
         self._generator.close()

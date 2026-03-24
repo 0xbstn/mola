@@ -215,13 +215,13 @@ class TestMLXBatchGeneratorPort:
             ]
         )
 
-        assert handles == [GeneratorHandle(uid=7), GeneratorHandle(uid=9)]
-        assert port._generator.active_batch.uids == [7, 9]
+        assert handles == [GeneratorHandle(uid=0), GeneratorHandle(uid=1)]
+        assert port._generator.active_batch.uids == [0, 1]
         assert port._generator.active_batch.y.tolist() == [101, 102]
         assert port._generator.active_batch.max_tokens == [32, 64]
-        assert port._generator.uid_count == 10
+        assert port._generator.uid_count == 2
 
-    def test_restore_states_rejects_duplicate_active_uids(self, monkeypatch):
+    def test_restore_states_assigns_fresh_uids_when_active_batch_exists(self, monkeypatch):
         monkeypatch.setattr(mlx_generator, "_load_batch_generator_cls", lambda: FakeBatchGenerator)
         monkeypatch.setattr(
             mlx_generator,
@@ -247,23 +247,22 @@ class TestMLXBatchGeneratorPort:
             tokens=[np.array([1, 2, 3], dtype=np.int32)],
         )
 
-        try:
-            port.restore_states(
-                [
-                    GeneratorState(
-                        handle=GeneratorHandle(uid=7),
-                        next_token=102,
-                        logprobs="lp-7-new",
-                        max_tokens=64,
-                        num_tokens=5,
-                        cache=["cache-7-new"],
-                        sampler="sampler-7-new",
-                        logits_processors=["lp7-new"],
-                        tokens=np.array([4, 5], dtype=np.int32),
-                    )
-                ]
-            )
-        except ValueError as exc:
-            assert "duplicate active handle" in str(exc)
-        else:
-            raise AssertionError("duplicate restore should be rejected")
+        handles = port.restore_states(
+            [
+                GeneratorState(
+                    handle=GeneratorHandle(uid=7),
+                    next_token=102,
+                    logprobs="lp-7-new",
+                    max_tokens=64,
+                    num_tokens=5,
+                    cache=["cache-7-new"],
+                    sampler="sampler-7-new",
+                    logits_processors=["lp7-new"],
+                    tokens=np.array([4, 5], dtype=np.int32),
+                )
+            ]
+        )
+
+        assert handles == [GeneratorHandle(uid=8)]
+        assert port._generator.active_batch.uids == [7, 8]
+        assert port._generator.uid_count == 9
