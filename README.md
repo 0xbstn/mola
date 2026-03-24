@@ -68,8 +68,11 @@ mola serve \
   --model mlx-community/Qwen3.5-35B-A3B-4bit \
   --adapter rust ./adapters/rust-lora \
   --adapter sql ./adapters/sql-lora \
+  --max-inflight-tokens 32768 \
   --port 8000
 ```
+
+`--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request.
 
 ### Query
 
@@ -191,6 +194,9 @@ Engine runtime metrics:
   "active_sequences": 0,
   "total_tokens_generated": 552,
   "requests_completed": 11,
+  "requests_rejected": 0,
+  "inflight_tokens_reserved": 0,
+  "token_budget_limit": 32768,
   "avg_ttft_ms": 53.8,
   "avg_tps": 225.6
 }

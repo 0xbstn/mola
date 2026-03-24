@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mola.engine import (
+    AdmissionRejected,
     EngineConfig,
     EngineMetrics,
     GenerateRequest,
@@ -24,9 +25,8 @@ def _make_engine(**overrides):
     mola_model = MagicMock()
     mola_model.tokenizer.eos_token_id = 0
     config = overrides.pop("config", None)
-    with patch("mola.engine.BatchGenerator"):
-        engine = MOLAEngine(mola_model, config)
-    return engine
+    generator_factory = overrides.pop("generator_factory", None)
+    return MOLAEngine(mola_model, config, generator_factory=generator_factory)
 
 
 class TestEngineMetrics:
@@ -76,6 +76,10 @@ class TestGenerateRequest:
         assert req.first_token_at is None
         assert req.token_count == 0
 
+    def test_estimated_tokens(self):
+        req = GenerateRequest([1, 2, 3], "rust", 7, None, asyncio.Queue())
+        assert req.estimated_tokens == 10
+
 
 class TestBackpressure:
     def test_submit_raises_on_full_queue(self):
@@ -83,6 +87,13 @@ class TestBackpressure:
         engine.submit(GenerateRequest([1], None, 10, None, asyncio.Queue()))
         with pytest.raises(queue.Full):
             engine.submit(GenerateRequest([2], None, 10, None, asyncio.Queue()))
+
+    def test_submit_rejects_when_token_budget_is_exceeded(self):
+        engine = _make_engine(config=EngineConfig(max_inflight_tokens=5))
+        with pytest.raises(AdmissionRejected):
+            engine.submit(GenerateRequest([1, 2, 3], None, 3, None, asyncio.Queue()))
+        assert engine.metrics.requests_rejected == 1
+        assert engine.metrics.inflight_tokens_reserved == 0
 
 
 class TestCancellation:
@@ -100,13 +111,27 @@ class TestCancellation:
         engine = _make_engine()
         q = asyncio.Queue()
         req = GenerateRequest([1], None, 10, None, q)
-        engine._uid_to_request[42] = req
+        engine._uid_to_request[(None, 42)] = req
         engine.cancel(q)
         assert req.cancelled is True
 
     def test_cancel_unknown_queue_is_noop(self):
         engine = _make_engine()
         engine.cancel(asyncio.Queue())
+
+    def test_cancel_pending_slot_request(self):
+        engine = _make_engine()
+        q = asyncio.Queue()
+        req = GenerateRequest([1], "rust", 10, None, q)
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust")
+        slot.pending_requests.append(req)
+        engine._generators["rust"] = slot
+
+        engine.cancel(q)
+        engine._process_cancelled()
+
+        assert list(slot.pending_requests) == []
+        assert engine.metrics.inflight_tokens_reserved == 0
 
 
 class TestIdleCleanup:
@@ -130,6 +155,17 @@ class TestIdleCleanup:
         assert "active" in engine._generators
         mock_gen.close.assert_not_called()
 
+    def test_keeps_slots_with_pending_requests(self):
+        engine = _make_engine(config=EngineConfig(idle_timeout=0.0))
+        mock_gen = MagicMock()
+        slot = _AdapterSlot(generator=mock_gen, adapter_id="active")
+        slot.pending_requests.append(GenerateRequest([1], "active", 10, None, asyncio.Queue()))
+        slot.last_active = time.time() - 100
+        engine._generators["active"] = slot
+        engine._cleanup_idle()
+        assert "active" in engine._generators
+        mock_gen.close.assert_not_called()
+
 
 class TestModelLock:
     def test_is_threading_lock(self):
@@ -146,11 +182,19 @@ class TestStop:
     def test_clears_state_and_closes_generators(self):
         engine = _make_engine()
         mock_gen = MagicMock()
-        engine._generators["test"] = _AdapterSlot(generator=mock_gen, adapter_id="test")
-        engine._uid_to_request[0] = GenerateRequest([1], None, 10, None, asyncio.Queue())
+        slot = _AdapterSlot(generator=mock_gen, adapter_id="test")
+        slot.pending_requests.append(GenerateRequest([2], "test", 10, None, asyncio.Queue()))
+        engine._generators["test"] = slot
+        req = GenerateRequest(
+            [1], "test", 10, None, asyncio.Queue()
+        )
+        engine._uid_to_request[("test", 0)] = req
+        engine.metrics.inflight_tokens_reserved = req.estimated_tokens + slot.pending_requests[0].estimated_tokens
+        engine._reserved_tokens = engine.metrics.inflight_tokens_reserved
         engine.stop()
         assert len(engine._generators) == 0
         assert len(engine._uid_to_request) == 0
+        assert engine.metrics.inflight_tokens_reserved == 0
         mock_gen.close.assert_called_once()
 
 
@@ -167,9 +211,86 @@ class TestPendingTracking:
         engine.submit(GenerateRequest([1], None, 10, None, q))
 
         mock_gen = MagicMock()
-        mock_gen.insert.return_value = [0]
         engine._generators[None] = _AdapterSlot(generator=mock_gen, adapter_id=None)
 
         engine._drain_requests()
         assert id(q) not in engine._pending_by_queue
-        assert 0 in engine._uid_to_request
+        assert len(engine._generators[None].pending_requests) == 1
+        assert engine.metrics.queued_requests == 1
+
+    def test_insert_pending_batches_same_adapter_requests(self):
+        engine = _make_engine(config=EngineConfig(prefill_batch_size=2))
+        q1 = asyncio.Queue()
+        q2 = asyncio.Queue()
+        engine.submit(GenerateRequest([1], "rust", 10, None, q1))
+        engine.submit(GenerateRequest([2], "rust", 12, None, q2))
+
+        mock_gen = MagicMock()
+        mock_gen.submit_batch.return_value = [MagicMock(uid=0), MagicMock(uid=1)]
+        slot = _AdapterSlot(generator=mock_gen, adapter_id="rust")
+        engine._generators["rust"] = slot
+
+        engine._drain_requests()
+        inserted = engine._insert_pending(slot)
+
+        assert inserted is True
+        assert slot.active_uids == {0, 1}
+        assert list(slot.pending_requests) == []
+        assert ("rust", 0) in engine._uid_to_request
+        assert ("rust", 1) in engine._uid_to_request
+        mock_gen.submit_batch.assert_called_once()
+
+
+class TestUidNamespacing:
+    def test_dispatch_routes_duplicate_uids_to_correct_queues(self):
+        engine = _make_engine()
+        rust_req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        sql_req = GenerateRequest([2], "sql", 10, None, asyncio.Queue())
+        engine._uid_to_request[("rust", 0)] = rust_req
+        engine._uid_to_request[("sql", 0)] = sql_req
+        engine._send_to_queue = lambda req, data: (req.response_queue.put_nowait(data), True)[1]
+
+        engine._dispatch_token("rust", 0, 11, None)
+        engine._dispatch_token("sql", 0, 22, None)
+
+        assert rust_req.response_queue.get_nowait()["token"] == 11
+        assert sql_req.response_queue.get_nowait()["token"] == 22
+
+
+class TestScheduling:
+    def test_orders_slots_by_oldest_unstarted_request(self):
+        engine = _make_engine()
+        now = time.time()
+
+        rust_req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        rust_req.created_at = now - 1
+        rust_req.first_token_at = now - 0.5
+
+        sql_req = GenerateRequest([2], "sql", 10, None, asyncio.Queue())
+        sql_req.created_at = now - 5
+
+        rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={0})
+        rust_slot.last_service_ts = now - 2
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql", active_uids={0})
+        sql_slot.last_service_ts = now - 1
+
+        engine._generators["rust"] = rust_slot
+        engine._generators["sql"] = sql_slot
+        engine._uid_to_request[("rust", 0)] = rust_req
+        engine._uid_to_request[("sql", 0)] = sql_req
+
+        ordered = engine._ordered_slots()
+        assert [slot.adapter_id for slot in ordered] == ["sql", "rust"]
+
+    def test_completion_releases_token_budget(self):
+        engine = _make_engine()
+        req = GenerateRequest([1, 2], "rust", 10, None, asyncio.Queue())
+        engine._reserved_tokens = req.estimated_tokens
+        engine.metrics.inflight_tokens_reserved = req.estimated_tokens
+        engine._uid_to_request[("rust", 0)] = req
+        engine._send_to_queue = lambda *_args, **_kwargs: True
+
+        engine._dispatch_token("rust", 0, 11, "stop")
+
+        assert engine.metrics.inflight_tokens_reserved == 0
+        assert ("rust", 0) not in engine._uid_to_request

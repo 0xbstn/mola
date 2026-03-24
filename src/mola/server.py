@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mola.engine import EngineConfig, GenerateRequest, MOLAEngine
+from mola.engine import AdmissionRejected, EngineConfig, GenerateRequest, MOLAEngine
 from mola.model import MOLAModel
 
 logger = logging.getLogger(__name__)
@@ -106,12 +106,14 @@ async def _stream_tokens(
     tokenizer,
     raw_request: Request,
 ) -> AsyncGenerator[str, None]:
+    qid = id(response_queue)
     request_id = f"chatcmpl-{int(time.time())}"
     tokens: list[int] = []
     prev_text = ""
 
     while True:
         if await raw_request.is_disconnected():
+            logger.debug(f"http_disconnect queue={qid} stream=true")
             engine.cancel(response_queue)
             return
         try:
@@ -119,11 +121,14 @@ async def _stream_tokens(
         except asyncio.TimeoutError:
             continue
         if data is None:
+            logger.debug(f"stream_recv queue={qid} kind=none")
             break
         if "error" in data:
+            logger.debug(f"stream_recv queue={qid} kind=error")
             yield f"data: {json.dumps({'error': data['error']})}\n\n"
             return
 
+        logger.debug(f"stream_recv queue={qid} kind=token")
         tokens.append(data["token"])
         full_text = tokenizer.decode(tokens)
         new_text = full_text[len(prev_text):]
@@ -145,6 +150,7 @@ async def _stream_tokens(
 
     yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': chat_request.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
     yield "data: [DONE]\n\n"
+    logger.debug(f"stream_done queue={qid}")
 
 
 def create_app(
@@ -183,8 +189,13 @@ def create_app(
 
         try:
             engine.submit(gen_request)
+        except AdmissionRejected as e:
+            raise HTTPException(503, str(e))
         except queue.Full:
             raise HTTPException(503, "Server overloaded, try again later")
+
+        qid = id(response_queue)
+        logger.debug(f"http_submit queue={qid} adapter={adapter_id} stream={body.stream}")
 
         if body.stream:
             return StreamingResponse(
@@ -193,8 +204,10 @@ def create_app(
             )
 
         tokens: list[int] = []
+        t_wait_start = time.time()
         while True:
             if await request.is_disconnected():
+                logger.debug(f"http_disconnect queue={qid} stream=false")
                 engine.cancel(response_queue)
                 raise HTTPException(499, "Client disconnected")
             try:
@@ -202,9 +215,17 @@ def create_app(
             except asyncio.TimeoutError:
                 continue
             if data is None:
+                logger.debug(f"http_recv queue={qid} kind=none")
+                logger.debug(
+                    f"http_done queue={qid} tokens={len(tokens)} "
+                    f"wait={time.time() - t_wait_start:.2f}s"
+                )
                 break
             if "error" in data:
+                logger.debug(f"http_recv queue={qid} kind=error")
                 raise HTTPException(500, data["error"])
+            logger.debug(f"http_recv queue={qid} kind=token")
+
             tokens.append(data["token"])
 
         text = mola_model.tokenizer.decode(tokens)
@@ -260,7 +281,9 @@ def create_app(
 
     @app.get("/v1/engine/metrics")
     async def engine_metrics():
-        return engine.metrics.snapshot()
+        snap = engine.metrics.snapshot()
+        snap["slots"] = engine.slot_snapshots()
+        return snap
 
     @app.get("/health")
     async def health():

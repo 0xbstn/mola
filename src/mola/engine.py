@@ -1,36 +1,27 @@
-"""Batched generation engine with per-adapter BatchGenerators.
-
-Each active adapter gets its own BatchGenerator (created on demand,
-destroyed after idle timeout). The engine runs in a background thread,
-round-robining between generators. Same-adapter requests are batched
-in a single forward pass via BatchGenerator.insert (continuous batching).
-
-Lifecycle:
-- cancel() works pre-UID (queued) and post-UID (generating)
-- model_lock prevents adapter load/unload from racing with forward passes
-- generators are closed explicitly on cleanup (Metal resource release)
-- stop() drains in-flight requests before shutting down
-"""
+"""Batched multi-adapter generation engine."""
 
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
-import mlx.core as mx
-from mlx_lm.generate import BatchGenerator
-
+from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPolicy
+from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
 from mola.context import adapter_context
+from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
 
 if TYPE_CHECKING:
     from mola.model import MOLAModel
 
 logger = logging.getLogger(__name__)
+
+RequestKey = tuple[str | None, int]
 
 
 @dataclass
@@ -40,6 +31,35 @@ class EngineConfig:
     prefill_batch_size: int = 8
     idle_timeout: float = 60.0
     response_queue_size: int = 1024
+    max_inflight_tokens: int = 32768
+
+
+@dataclass
+class SlotMetrics:
+    steps_called: int = 0
+    tokens_emitted: int = 0
+    total_next_ms: float = 0.0
+    last_step_ts: float = 0.0
+    max_gap_ms: float = 0.0
+
+    def record_step(self, duration_ms: float, tokens: int):
+        now = time.time()
+        if self.last_step_ts > 0:
+            gap = (now - self.last_step_ts) * 1000
+            if gap > self.max_gap_ms:
+                self.max_gap_ms = gap
+        self.last_step_ts = now
+        self.steps_called += 1
+        self.tokens_emitted += tokens
+        self.total_next_ms += duration_ms
+
+    def snapshot(self) -> dict:
+        return {
+            "steps": self.steps_called,
+            "tokens": self.tokens_emitted,
+            "avg_next_ms": round(self.total_next_ms / self.steps_called, 2) if self.steps_called else 0,
+            "max_gap_ms": round(self.max_gap_ms, 1),
+        }
 
 
 @dataclass
@@ -49,6 +69,9 @@ class EngineMetrics:
     active_sequences: int = 0
     total_tokens_generated: int = 0
     requests_completed: int = 0
+    requests_rejected: int = 0
+    inflight_tokens_reserved: int = 0
+    token_budget_limit: int = 0
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -67,16 +90,15 @@ class EngineMetrics:
             "active_sequences": self.active_sequences,
             "total_tokens_generated": self.total_tokens_generated,
             "requests_completed": self.requests_completed,
+            "requests_rejected": self.requests_rejected,
+            "inflight_tokens_reserved": self.inflight_tokens_reserved,
+            "token_budget_limit": self.token_budget_limit,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
-            )
-            if self._ttft_samples
-            else 0,
+            ) if self._ttft_samples else 0,
             "avg_tps": round(
                 sum(self._tps_samples) / len(self._tps_samples), 1
-            )
-            if self._tps_samples
-            else 0,
+            ) if self._tps_samples else 0,
         }
 
 
@@ -91,35 +113,64 @@ class GenerateRequest:
     cancelled: bool = False
     first_token_at: float | None = None
     token_count: int = 0
+    inserted_at: float | None = None
+    uid: int | None = None
+    terminal_sent_at: float | None = None
+    budget_released: bool = False
+
+    @property
+    def qid(self) -> int:
+        return id(self.response_queue)
+
+    @property
+    def estimated_tokens(self) -> int:
+        return len(self.prompt_tokens) + max(self.max_tokens, 0)
+
+    def to_submission(self) -> GeneratorSubmission:
+        return GeneratorSubmission(
+            prompt_tokens=self.prompt_tokens,
+            max_tokens=self.max_tokens,
+            sampler=self.sampler,
+        )
 
 
 @dataclass
 class _AdapterSlot:
-    generator: BatchGenerator
+    generator: GeneratorPort
     adapter_id: str | None
     active_uids: set[int] = field(default_factory=set)
+    pending_requests: deque[GenerateRequest] = field(default_factory=deque)
     last_active: float = field(default_factory=time.time)
+    last_service_ts: float = 0.0
+    slot_metrics: SlotMetrics = field(default_factory=SlotMetrics)
 
 
 class MOLAEngine:
-    """Batched multi-adapter generation engine.
-
-    model_lock is held during forward passes and must be acquired
-    by admin operations (adapter load/unload) to prevent racing.
-    """
-
-    def __init__(self, mola_model: MOLAModel, config: EngineConfig | None = None):
+    def __init__(
+        self,
+        mola_model: MOLAModel,
+        config: EngineConfig | None = None,
+        generator_factory: Callable[..., GeneratorPort] | None = None,
+    ):
         self.mola_model = mola_model
         self.config = config or EngineConfig()
         self.metrics = EngineMetrics()
+        self.metrics.token_budget_limit = self.config.max_inflight_tokens
+        self.admission_policy = TokenBudgetAdmissionPolicy(self.config.max_inflight_tokens)
+        self.scheduling_policy: WaitingAwareSchedulingPolicy[str | None] = (
+            WaitingAwareSchedulingPolicy()
+        )
+        self._generator_factory = generator_factory or self._default_generator_factory
         self.model_lock = threading.Lock()
+        self._state_lock = threading.Lock()
 
         self._request_queue: queue.Queue[GenerateRequest] = queue.Queue(
             maxsize=self.config.max_queued_requests
         )
         self._generators: dict[str | None, _AdapterSlot] = {}
-        self._uid_to_request: dict[int, GenerateRequest] = {}
+        self._uid_to_request: dict[RequestKey, GenerateRequest] = {}
         self._pending_by_queue: dict[int, GenerateRequest] = {}
+        self._reserved_tokens = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -135,35 +186,104 @@ class MOLAEngine:
         logger.info("Engine started")
 
     def stop(self):
+        logger.debug(
+            f"engine_stop inflight={len(self._uid_to_request)} "
+            f"pending={len(self._pending_by_queue)} "
+            f"generators={len(self._generators)}"
+        )
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-        for uid, req in list(self._uid_to_request.items()):
+
+        with self._state_lock:
+            pending = {req.qid: req for req in self._pending_by_queue.values()}
+            for slot in self._generators.values():
+                for req in slot.pending_requests:
+                    pending[req.qid] = req
+            active = list(self._uid_to_request.values())
+            slots = list(self._generators.values())
+            self._uid_to_request.clear()
+            self._pending_by_queue.clear()
+            self._generators.clear()
+            self._reserved_tokens = 0
+            self.metrics.inflight_tokens_reserved = 0
+            self.metrics.queued_requests = 0
+            self.metrics.active_generators = 0
+            self.metrics.active_sequences = 0
+
+        for req in [*active, *pending.values()]:
             self._send_to_queue(req, {"error": "server shutting down"})
             self._send_to_queue(req, None)
-        self._uid_to_request.clear()
-        for slot in self._generators.values():
+        for slot in slots:
             self._close_generator(slot)
-        self._generators.clear()
-        self._pending_by_queue.clear()
         logger.info("Engine stopped")
 
     def submit(self, request: GenerateRequest):
-        """Raises queue.Full on backpressure."""
-        self._request_queue.put_nowait(request)
-        self._pending_by_queue[id(request.response_queue)] = request
-        self.metrics.queued_requests = self._request_queue.qsize()
+        with self._state_lock:
+            decision = self.admission_policy.evaluate(
+                reserved_tokens=self._reserved_tokens,
+                request_tokens=request.estimated_tokens,
+            )
+            if not decision.accepted:
+                self.metrics.requests_rejected += 1
+                raise AdmissionRejected(decision.reason or "Server overloaded")
+            self._reserved_tokens = decision.projected_tokens
+            self.metrics.inflight_tokens_reserved = self._reserved_tokens
+            self._pending_by_queue[request.qid] = request
+
+        try:
+            self._request_queue.put_nowait(request)
+        except queue.Full:
+            with self._state_lock:
+                self._pending_by_queue.pop(request.qid, None)
+                self._release_budget_locked(request)
+                self.metrics.queued_requests = self._queued_request_count_locked()
+            raise
+
+        with self._state_lock:
+            self.metrics.queued_requests = self._queued_request_count_locked()
+        logger.debug(
+            f"submit queue={request.qid} adapter={request.adapter_id} "
+            f"prompt_len={len(request.prompt_tokens)} max_tokens={request.max_tokens} "
+            f"qsize={self.metrics.queued_requests}"
+        )
 
     def cancel(self, response_queue: asyncio.Queue):
-        """Works pre-UID (still queued) and post-UID (in a generator)."""
-        req = self._pending_by_queue.get(id(response_queue))
-        if req:
-            req.cancelled = True
-            return
-        for req in self._uid_to_request.values():
-            if req.response_queue is response_queue:
+        qid = id(response_queue)
+        with self._state_lock:
+            req = self._pending_by_queue.get(qid)
+            if req:
                 req.cancelled = True
+                logger.debug(f"cancel queue={qid} state=pending")
                 return
+            for slot in self._generators.values():
+                for pending_req in slot.pending_requests:
+                    if pending_req.response_queue is response_queue:
+                        pending_req.cancelled = True
+                        logger.debug(f"cancel queue={qid} state=pending")
+                        return
+            for req in self._uid_to_request.values():
+                if req.response_queue is response_queue:
+                    req.cancelled = True
+                    logger.debug(f"cancel queue={qid} uid={req.uid} state=active")
+                    return
+        logger.debug(f"cancel queue={qid} state=unknown")
+
+    def slot_snapshots(self) -> dict:
+        now = time.time()
+        with self._state_lock:
+            return {
+                str(aid): {
+                    "active_uids": len(slot.active_uids),
+                    "batch_size": len(slot.active_uids),
+                    "pending_requests": len(slot.pending_requests),
+                    "oldest_wait_ms": round(
+                        max(0.0, now - slot.pending_requests[0].created_at) * 1000, 1
+                    ) if slot.pending_requests else 0,
+                    **slot.slot_metrics.snapshot(),
+                }
+                for aid, slot in self._generators.items()
+            }
 
     def _run(self):
         cleanup_interval = 10.0
@@ -174,33 +294,56 @@ class MOLAEngine:
             self._process_cancelled()
 
             any_active = False
-            for adapter_id, slot in list(self._generators.items()):
-                if not slot.active_uids:
+            for slot in self._ordered_slots():
+                if self._insert_pending(slot):
+                    any_active = True
+
+                with self._state_lock:
+                    active_count = len(slot.active_uids)
+                if not active_count:
                     continue
 
                 any_active = True
+                logger.debug(
+                    f"slot_step_start adapter={slot.adapter_id} active={active_count}"
+                )
+                t0 = time.monotonic()
                 with self.model_lock:
-                    with adapter_context(adapter_id):
+                    with adapter_context(slot.adapter_id):
                         try:
-                            responses = slot.generator.next()
+                            responses = slot.generator.step()
                         except StopIteration:
                             continue
                         except Exception:
                             logger.exception(
-                                f"BatchGenerator error for adapter '{adapter_id}'"
+                                f"BatchGenerator error for adapter '{slot.adapter_id}'"
                             )
                             self._fail_slot(slot, "internal error")
                             continue
+                step_ms = (time.monotonic() - t0) * 1000
 
-                slot.last_active = time.time()
                 finished_uids = set()
+                resp_uids = []
+                resp_reasons = []
                 for resp in responses:
-                    self._dispatch_token(resp.uid, resp.token, resp.finish_reason)
+                    resp_uids.append(resp.handle.uid)
+                    resp_reasons.append(resp.finish_reason)
+                    self._dispatch_token(
+                        slot.adapter_id, resp.handle.uid, resp.token, resp.finish_reason
+                    )
                     if resp.finish_reason is not None:
-                        finished_uids.add(resp.uid)
+                        finished_uids.add(resp.handle.uid)
 
-                slot.active_uids -= finished_uids
-                self._update_sequence_count()
+                with self._state_lock:
+                    slot.slot_metrics.record_step(step_ms, len(responses))
+                    slot.last_active = time.time()
+                    slot.last_service_ts = slot.last_active
+                    slot.active_uids -= finished_uids
+                    self._update_sequence_count_locked()
+                logger.debug(
+                    f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
+                    f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f}"
+                )
 
             now = time.time()
             if now - last_cleanup > cleanup_interval:
@@ -218,103 +361,184 @@ class MOLAEngine:
             except queue.Empty:
                 break
 
-            self._pending_by_queue.pop(id(req.response_queue), None)
+            with self._state_lock:
+                self._pending_by_queue.pop(req.qid, None)
             if req.cancelled:
+                logger.debug(f"drain_skip queue={req.qid} adapter={req.adapter_id} cancelled=true")
+                with self._state_lock:
+                    self._release_budget_locked(req)
+                    self.metrics.queued_requests = self._queued_request_count_locked()
                 continue
 
             slot = self._get_or_create_slot(req.adapter_id)
-            with self.model_lock:
-                with adapter_context(req.adapter_id):
-                    uids = slot.generator.insert(
-                        prompts=[req.prompt_tokens],
-                        max_tokens=[req.max_tokens],
-                        samplers=[req.sampler] if req.sampler else None,
-                    )
-            uid = uids[0]
-            slot.active_uids.add(uid)
-            self._uid_to_request[uid] = req
-            slot.last_active = time.time()
+            with self._state_lock:
+                slot.pending_requests.append(req)
+                slot.last_active = time.time()
+                self.metrics.queued_requests = self._queued_request_count_locked()
             drained += 1
 
         if drained:
-            self.metrics.queued_requests = self._request_queue.qsize()
-            self._update_sequence_count()
+            with self._state_lock:
+                self._update_sequence_count_locked()
 
     def _process_cancelled(self):
-        to_remove = [
-            uid for uid, req in self._uid_to_request.items() if req.cancelled
-        ]
-        for uid in to_remove:
+        with self._state_lock:
             for slot in self._generators.values():
-                if uid in slot.active_uids:
-                    try:
-                        slot.generator.remove([uid])
-                    except Exception:
-                        pass
-                    slot.active_uids.discard(uid)
-                    break
-            del self._uid_to_request[uid]
-        if to_remove:
-            self._update_sequence_count()
+                if not slot.pending_requests:
+                    continue
+                kept = deque()
+                while slot.pending_requests:
+                    req = slot.pending_requests.popleft()
+                    if req.cancelled:
+                        logger.debug(
+                            f"cancel_remove uid=pending adapter={slot.adapter_id} removed=false"
+                        )
+                        self._release_budget_locked(req)
+                        continue
+                    kept.append(req)
+                slot.pending_requests = kept
+            to_remove = [
+                key for key, req in self._uid_to_request.items() if req.cancelled
+            ]
+            self.metrics.queued_requests = self._queued_request_count_locked()
 
-    def _dispatch_token(self, uid: int, token: int, finish_reason: str | None):
-        req = self._uid_to_request.get(uid)
-        if not req or req.cancelled:
-            return
+        for adapter_id, uid in to_remove:
+            removed = False
+            with self._state_lock:
+                slot = self._generators.get(adapter_id)
+            if slot and uid in slot.active_uids:
+                try:
+                    slot.generator.cancel([GeneratorHandle(uid=uid)])
+                    removed = True
+                except Exception:
+                    pass
+                with self._state_lock:
+                    slot.active_uids.discard(uid)
+            logger.debug(
+                f"cancel_remove uid={uid} adapter={adapter_id} removed={removed}"
+            )
+            with self._state_lock:
+                req = self._uid_to_request.pop((adapter_id, uid), None)
+                if req:
+                    self._release_budget_locked(req)
+                self._update_sequence_count_locked()
+
+    def _dispatch_token(
+        self,
+        adapter_id: str | None,
+        uid: int,
+        token: int,
+        finish_reason: str | None,
+    ):
+        with self._state_lock:
+            req = self._uid_to_request.get((adapter_id, uid))
+            if not req or req.cancelled:
+                return
 
         now = time.time()
         if req.first_token_at is None:
             req.first_token_at = now
 
-        if not self._send_to_queue(req, {"token": token, "finish_reason": finish_reason}):
+        ok = self._send_to_queue(req, {"token": token, "finish_reason": finish_reason})
+        if not ok:
+            logger.debug(
+                f"dispatch_fail uid={uid} queue={req.qid} adapter={req.adapter_id} "
+                f"token_count={req.token_count}"
+            )
             req.cancelled = True
             return
 
         req.token_count += 1
         self.metrics.total_tokens_generated += 1
+        logger.debug(
+            f"dispatch_token uid={uid} queue={req.qid} adapter={req.adapter_id} "
+            f"finish={finish_reason} token_count={req.token_count} cancelled={req.cancelled}"
+        )
 
         if finish_reason is not None:
-            self._send_to_queue(req, None)
+            ok = self._send_to_queue(req, None)
+            if ok:
+                req.terminal_sent_at = time.time()
+                logger.debug(
+                    f"dispatch_terminal uid={uid} queue={req.qid} adapter={req.adapter_id}"
+                )
+            else:
+                logger.warning(f"dispatch_terminal_fail uid={uid} queue={req.qid}")
+
             ttft = (req.first_token_at - req.created_at) if req.first_token_at else 0
             elapsed = now - req.first_token_at if req.first_token_at and req.first_token_at != now else 0.001
             tps = req.token_count / elapsed if elapsed > 0 else 0
             self.metrics.record_completion(ttft, tps)
-            self._uid_to_request.pop(uid, None)
+            logger.debug(
+                f"dispatch_finish uid={uid} adapter={req.adapter_id} reason={finish_reason} "
+                f"tokens={req.token_count} ttft={ttft*1000:.0f}ms tps={tps:.0f} "
+                f"total={now - req.created_at:.3f}s"
+            )
+            with self._state_lock:
+                self._uid_to_request.pop((adapter_id, uid), None)
+                self._release_budget_locked(req)
+                self._update_sequence_count_locked()
 
     def _send_to_queue(self, req: GenerateRequest, data) -> bool:
-        """Thread-safe dispatch to the async response queue. Returns False on failure."""
         if not self._loop:
             return False
         try:
             self._loop.call_soon_threadsafe(req.response_queue.put_nowait, data)
             return True
-        except (asyncio.QueueFull, RuntimeError):
+        except (asyncio.QueueFull, RuntimeError) as e:
+            logger.debug(f"send_to_queue_fail queue={req.qid} error={e}")
             return False
 
     def _fail_slot(self, slot: _AdapterSlot, error_msg: str):
-        for uid in list(slot.active_uids):
-            req = self._uid_to_request.pop(uid, None)
+        with self._state_lock:
+            uids = list(slot.active_uids)
+            pending = list(slot.pending_requests)
+            slot.pending_requests.clear()
+        logger.debug(f"slot_fail adapter={slot.adapter_id} uids={uids}")
+        for req in pending:
+            self._send_to_queue(req, {"error": error_msg})
+            self._send_to_queue(req, None)
+            with self._state_lock:
+                self._release_budget_locked(req)
+        for uid in uids:
+            with self._state_lock:
+                req = self._uid_to_request.pop((slot.adapter_id, uid), None)
             if req:
                 self._send_to_queue(req, {"error": error_msg})
                 self._send_to_queue(req, None)
-        slot.active_uids.clear()
-        self._update_sequence_count()
+                with self._state_lock:
+                    self._release_budget_locked(req)
+        with self._state_lock:
+            slot.active_uids.clear()
+            self.metrics.queued_requests = self._queued_request_count_locked()
+            self._update_sequence_count_locked()
 
     def _get_or_create_slot(self, adapter_id: str | None) -> _AdapterSlot:
-        if adapter_id not in self._generators:
-            gen = BatchGenerator(
-                self.mola_model.model,
-                max_tokens=4096,
-                stop_tokens=self._stop_tokens,
-                completion_batch_size=self.config.max_batch_size,
-                prefill_batch_size=self.config.prefill_batch_size,
-            )
-            self._generators[adapter_id] = _AdapterSlot(
-                generator=gen, adapter_id=adapter_id
-            )
-            logger.info(f"Created BatchGenerator for adapter '{adapter_id}'")
+        with self._state_lock:
+            slot = self._generators.get(adapter_id)
+        if slot is not None:
+            return slot
+        gen = self._generator_factory(
+            self.mola_model.model,
+            max_tokens=4096,
+            stop_tokens=self._stop_tokens,
+            completion_batch_size=self.config.max_batch_size,
+            prefill_batch_size=self.config.prefill_batch_size,
+        )
+        slot = _AdapterSlot(generator=gen, adapter_id=adapter_id)
+        with self._state_lock:
+            if adapter_id in self._generators:
+                self._close_generator(slot)
+                return self._generators[adapter_id]
+            self._generators[adapter_id] = slot
             self.metrics.active_generators = len(self._generators)
-        return self._generators[adapter_id]
+        logger.info(f"Created BatchGenerator for adapter '{adapter_id}'")
+        return slot
+
+    def _default_generator_factory(self, *args, **kwargs) -> GeneratorPort:
+        from mola.infrastructure.mlx_generator import MLXBatchGeneratorPort
+
+        return MLXBatchGeneratorPort(*args, **kwargs)
 
     def _close_generator(self, slot: _AdapterSlot):
         try:
@@ -322,25 +546,134 @@ class MOLAEngine:
         except Exception:
             pass
 
-    def _cleanup_idle(self):
-        now = time.time()
-        to_remove = [
-            aid
-            for aid, slot in self._generators.items()
-            if not slot.active_uids
-            and (now - slot.last_active) > self.config.idle_timeout
-        ]
-        for aid in to_remove:
-            self._close_generator(self._generators[aid])
-            del self._generators[aid]
-            logger.info(f"Destroyed idle BatchGenerator for adapter '{aid}'")
-        if to_remove:
-            self.metrics.active_generators = len(self._generators)
+    def _ordered_slots(self) -> list[_AdapterSlot]:
+        with self._state_lock:
+            slots = {
+                aid: slot
+                for aid, slot in self._generators.items()
+                if slot.active_uids or slot.pending_requests
+            }
+            states = [
+                self._slot_state_locked(aid, slot)
+                for aid, slot in slots.items()
+            ]
+        ordered_ids = self.scheduling_policy.order(states)
+        return [slots[adapter_id] for adapter_id in ordered_ids]
 
-    def _update_sequence_count(self):
+    def _slot_state_locked(
+        self,
+        adapter_id: str | None,
+        slot: _AdapterSlot,
+    ) -> SlotSchedulingState[str | None]:
+        return SlotSchedulingState(
+            slot_id=adapter_id,
+            active_count=len(slot.active_uids),
+            pending_count=len(slot.pending_requests),
+            last_service_ts=slot.last_service_ts,
+            last_active_ts=slot.last_active,
+            oldest_unstarted_ts=self._oldest_unstarted_ts_locked(slot),
+        )
+
+    def _oldest_unstarted_ts_locked(self, slot: _AdapterSlot) -> float | None:
+        candidates = [req.created_at for req in slot.pending_requests]
+        for uid in slot.active_uids:
+            req = self._uid_to_request.get((slot.adapter_id, uid))
+            if req and req.first_token_at is None:
+                candidates.append(req.created_at)
+        return min(candidates) if candidates else None
+
+    def _insert_pending(self, slot: _AdapterSlot) -> bool:
+        with self._state_lock:
+            capacity = self.config.max_batch_size - len(slot.active_uids)
+            if capacity <= 0:
+                return False
+            limit = min(self.config.prefill_batch_size, capacity)
+            batch: list[GenerateRequest] = []
+            while slot.pending_requests and len(batch) < limit:
+                req = slot.pending_requests.popleft()
+                if req.cancelled:
+                    logger.debug(
+                        f"drain_skip queue={req.qid} adapter={req.adapter_id} cancelled=true"
+                    )
+                    self._release_budget_locked(req)
+                    continue
+                batch.append(req)
+            self.metrics.queued_requests = self._queued_request_count_locked()
+
+        if not batch:
+            return False
+
+        try:
+            with self.model_lock:
+                with adapter_context(slot.adapter_id):
+                    handles = slot.generator.submit_batch(
+                        [req.to_submission() for req in batch]
+                    )
+        except Exception:
+            logger.exception(f"BatchGenerator insert error for adapter '{slot.adapter_id}'")
+            for req in batch:
+                self._send_to_queue(req, {"error": "internal error"})
+                self._send_to_queue(req, None)
+                with self._state_lock:
+                    self._release_budget_locked(req)
+            with self._state_lock:
+                self.metrics.queued_requests = self._queued_request_count_locked()
+            return False
+
+        inserted_at = time.time()
+        with self._state_lock:
+            for req, handle in zip(batch, handles, strict=True):
+                uid = handle.uid
+                req.uid = uid
+                req.inserted_at = inserted_at
+                slot.active_uids.add(uid)
+                self._uid_to_request[(slot.adapter_id, uid)] = req
+                logger.debug(
+                    f"drain_insert queue={req.qid} adapter={req.adapter_id} uid={uid} "
+                    f"slot_active={len(slot.active_uids)} generators={len(self._generators)} "
+                    f"queue_wait={req.inserted_at - req.created_at:.3f}s"
+                )
+            slot.last_active = inserted_at
+            slot.last_service_ts = inserted_at
+            self.metrics.queued_requests = self._queued_request_count_locked()
+            self._update_sequence_count_locked()
+        return True
+
+    def _queued_request_count_locked(self) -> int:
+        return self._request_queue.qsize() + sum(
+            len(slot.pending_requests) for slot in self._generators.values()
+        )
+
+    def _release_budget_locked(self, req: GenerateRequest):
+        if req.budget_released:
+            return
+        req.budget_released = True
+        self._reserved_tokens = max(0, self._reserved_tokens - req.estimated_tokens)
+        self.metrics.inflight_tokens_reserved = self._reserved_tokens
+
+    def _update_sequence_count_locked(self):
         self.metrics.active_sequences = sum(
             len(s.active_uids) for s in self._generators.values()
         )
+
+    def _cleanup_idle(self):
+        now = time.time()
+        with self._state_lock:
+            to_remove = [
+                aid
+                for aid, slot in self._generators.items()
+                if not slot.active_uids
+                and not slot.pending_requests
+                and (now - slot.last_active) > self.config.idle_timeout
+            ]
+        for aid in to_remove:
+            with self._state_lock:
+                slot = self._generators.pop(aid)
+            self._close_generator(slot)
+            logger.info(f"Destroyed idle BatchGenerator for adapter '{aid}'")
+        if to_remove:
+            with self._state_lock:
+                self.metrics.active_generators = len(self._generators)
 
 
 def _get_stop_tokens(tokenizer) -> set[int]:

@@ -33,11 +33,25 @@ def main(verbose: bool):
 )
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8000, type=int)
-def serve(model: str, adapter: tuple, host: str, port: int):
+@click.option(
+    "--max-inflight-tokens",
+    default=32768,
+    show_default=True,
+    type=int,
+    help="Global in-flight token budget for admission control",
+)
+def serve(
+    model: str,
+    adapter: tuple,
+    host: str,
+    port: int,
+    max_inflight_tokens: int,
+):
     """Start the MOLA inference server."""
     import uvicorn
 
     from mola.model import MOLAModel
+    from mola.engine import EngineConfig
     from mola.server import create_app
 
     mola_model = MOLAModel(model)
@@ -45,7 +59,10 @@ def serve(model: str, adapter: tuple, host: str, port: int):
     for name, path in adapter:
         mola_model.load_adapter(name, path)
 
-    app = create_app(mola_model)
+    app = create_app(
+        mola_model,
+        EngineConfig(max_inflight_tokens=max_inflight_tokens),
+    )
 
     click.echo(f"MOLA serving on http://{host}:{port}")
     click.echo(f"  Base model: {model}")
