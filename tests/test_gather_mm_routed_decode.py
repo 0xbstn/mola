@@ -88,7 +88,41 @@ def _expected(token_slot_ids, x):
 
 class TestGatherMMRoutedDecodeBackend:
     def test_homogeneous_delta_matches_reference_oracle(self, monkeypatch):
-        module = _load_backend_module(monkeypatch)
+        calls = []
+
+        def gather_mm(lhs, rhs, *, rhs_indices, sorted_indices=False):
+            calls.append(rhs_indices.tolist())
+            lhs = np.asarray(lhs)
+            rhs = np.asarray(rhs)
+            rhs_indices = np.asarray(rhs_indices, dtype=np.int32)
+            out = []
+            for row, rhs_index in enumerate(rhs_indices):
+                out.append(lhs[row] @ rhs[rhs_index])
+            return np.stack(out, axis=0)
+
+        mlx_pkg = ModuleType("mlx")
+        core_mod = ModuleType("mlx.core")
+        core_mod.array = lambda values, dtype=None: np.array(values, dtype=dtype)
+        core_mod.concatenate = lambda values, axis=0: np.concatenate(values, axis=axis)
+        core_mod.stack = lambda values, axis=0: np.stack(values, axis=axis)
+        core_mod.expand_dims = np.expand_dims
+        core_mod.gather_mm = gather_mm
+        core_mod.int32 = np.int32
+        core_mod.float16 = np.dtype("float16")
+        core_mod.bfloat16 = "bfloat16"
+        core_mod.float32 = np.dtype("float32")
+        mlx_pkg.core = core_mod
+        monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
+        monkeypatch.setitem(sys.modules, "mlx.core", core_mod)
+
+        module_name = "mola_test_gather_mm_routed_decode_hom"
+        path = Path(__file__).resolve().parents[1] / "src/mola/infrastructure/gather_mm_routed_decode.py"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        monkeypatch.setitem(sys.modules, module_name, module)
+        spec.loader.exec_module(module)
+
         factory = module.GatherMMRoutedLoRADeltaSessionFactory(strict=True)
         session = factory.build((_view(),), (4, 4, 4))
         x = np.array([[10.0, 1.0], [2.0, 5.0], [7.0, 3.0]], dtype=np.float32)
@@ -96,6 +130,7 @@ class TestGatherMMRoutedDecodeBackend:
         delta = session.delta("layers.0.q_proj", x)
 
         assert np.allclose(delta, _expected((4, 4, 4), x))
+        assert calls == []
 
     def test_mixed_delta_uses_pack_row_indices_and_restores_order(self, monkeypatch):
         seen_rhs_indices = []

@@ -42,6 +42,14 @@ class GatherMMRoutedLoRADeltaSession:
             return None
 
         try:
+            if execution.plan.homogeneous_slot_id is not None:
+                pack_row = execution.plan.groups[0].pack_row
+                delta = (
+                    flat_x @ execution.pack.lora_a[pack_row]
+                ) @ execution.pack.lora_b[pack_row]
+                delta = execution.pack.scales[pack_row] * delta
+                return delta.reshape(tuple(x.shape[:-1]) + (delta.shape[-1],))
+
             slot_row_by_id = execution.pack.slot_row_by_id
             rhs_indices = mx.array(
                 [slot_row_by_id[slot_id] for slot_id in execution.token_slot_ids],
