@@ -28,7 +28,7 @@ Switch between adapters: instant.
 Same-adapter requests: batched.
 ```
 
-> **Status:** Alpha. Core serving works, same-adapter batching is healthy, and the API contract is stable enough for experimentation. Mixed-adapter decode is still the main performance ceiling. Tested on mlx-lm 0.31.1.
+> **Status:** Alpha. Core serving works, same-adapter batching is healthy, and the API contract is stable enough for experimentation. Mixed-adapter decode is still the main performance ceiling. An opt-in homogeneous routed-decode reference path now exists behind a flag, but it still needs validation on a clean MLX runtime. Tested on mlx-lm 0.31.1.
 
 ## Why
 
@@ -49,6 +49,7 @@ MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory unt
 - **Standard PEFT format** -- loads adapters trained with mlx-lm, mlx-tune, or any PEFT-compatible tool
 - **Token-budget admission control** -- `--max-inflight-tokens` limits total in-flight work using `prompt_tokens + max_tokens`
 - **Engine metrics** -- TTFT, tok/s, queue depth, active sequences, and lock-wait counters via `/v1/engine/metrics`
+- **Experimental routed decode reference** -- `--enable-routed-decode-reference` prepares a homogeneous decode-only routed LoRA path for pre-kernel validation
 - **Backpressure** -- returns 503 when overloaded instead of queuing unboundedly
 - **Client disconnect handling** -- cancelled requests are removed from the engine
 
@@ -70,10 +71,13 @@ mola serve \
   --adapter rust ./adapters/rust-lora \
   --adapter sql ./adapters/sql-lora \
   --max-inflight-tokens 32768 \
+  --enable-routed-decode-reference \
   --port 8000
 ```
 
 `--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request. It matters under heavy prefill load and should be tuned against available unified memory.
+
+`--enable-routed-decode-reference` turns on the current homogeneous routed-decode reference path. It is meant for controlled validation, not as the default production path yet.
 
 ### Query
 
