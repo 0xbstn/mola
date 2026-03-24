@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">MOLA</h1>
   <p align="center"><b>Multi-adapter Orchestration LoRA Apple</b></p>
-  <p align="center">Multi-LoRA inference server for Apple Silicon — one base model, many adapters, zero reload.</p>
+  <p align="center">Multi-LoRA inference server for Apple Silicon -- one base model, many adapters, zero reload.</p>
 </p>
 
 <p align="center">
@@ -14,50 +14,49 @@
 
 ---
 
-MOLA serves multiple LoRA adapters from a single base model on Apple Silicon. Load your base model once, hot-swap adapters per request, no reloading.
+MOLA serves multiple LoRA adapters from a single base model on Apple Silicon. Load your base model once, hot-swap adapters per request, no reloading. Same-adapter requests are batched in a single GPU forward pass.
 
 ```
 Base model (18 GB, loaded once)
-├── Adapter "rust"        (+150 MB)  — Rust systems programming
-├── Adapter "bioml"       (+150 MB)  — protein structure prediction
-├── Adapter "k8s-ops"     (+150 MB)  — Kubernetes troubleshooting
-└── Adapter "sql"         (+150 MB)  — SQL query optimization
+├── Adapter "rust"        (+150 MB)  -- Rust systems programming
+├── Adapter "bioml"       (+150 MB)  -- protein structure prediction
+├── Adapter "k8s-ops"     (+150 MB)  -- Kubernetes troubleshooting
+└── Adapter "sql"         (+150 MB)  -- SQL query optimization
 
 Total memory: ~18.6 GB instead of 72 GB for 4 separate models.
 Switch between adapters: instant.
+Same-adapter requests: batched.
 ```
 
-> **Status:** MOLA is alpha. Core functionality works, API contract is stable, but no production benchmarks yet. Contributions welcome.
+> **Status:** Alpha. Core serving works, batching engine validated, API contract stable. Tested on mlx-lm 0.31.1.
 
 ## Why
 
-On CUDA, [vLLM](https://github.com/vllm-project/vllm) supports multi-LoRA serving with `--enable-lora`. On Apple Silicon with MLX, switching adapters means reloading the entire base model — 18+ GB, 30+ seconds each time.
+On CUDA, [vLLM](https://github.com/vllm-project/vllm) supports multi-LoRA serving with `--enable-lora`. On Apple Silicon with MLX, switching adapters means reloading the entire base model -- 18+ GB, 30+ seconds each time.
 
-MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory untouched. Adapter deltas are applied dynamically during the forward pass. Switching adapters is just swapping which delta matrices are active — zero reload, zero downtime.
+MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory untouched. Adapter deltas are applied dynamically during the forward pass. Switching adapters is just swapping which delta matrices are active -- zero reload, zero downtime.
 
 ## Features
 
-- **Per-request adapter selection** — choose which adapter via the `model` field in the API
-- **Hot-load / hot-unload** — add or remove adapters at runtime without restarting
-- **OpenAI-compatible API** — works with any client that speaks OpenAI format
-- **SSE streaming** — token-by-token streaming out of the box
-- **Minimal overhead** — adapter deltas are two small matrix multiplies per layer
-- **Supports quantized models** — works with 4-bit and 8-bit MLX models
-- **MoE base models supported** — serves MoE models (Qwen3.5, DeepSeek, Mixtral) with attention-layer LoRA adapters. Full expert-layer LoRA (SwitchLinear) is on the roadmap.
-- **Standard PEFT format** — loads adapters trained with mlx-lm, mlx-tune, or any PEFT-compatible tool
+- **Per-request adapter selection** -- choose which adapter via the `model` field
+- **Same-adapter batching** -- concurrent requests with the same adapter are batched in a single GPU forward pass via `BatchGenerator`
+- **Continuous batching** -- new requests can join active adapter batches while capacity is available
+- **Hot-load / hot-unload** -- add or remove adapters at runtime without restarting
+- **OpenAI-compatible API** -- OpenAI-style chat completions subset; works with many OpenAI-compatible clients (Msty, Cursor, etc.)
+- **SSE streaming** -- token-by-token streaming
+- **Supports quantized models** -- works with 4-bit and 8-bit MLX models
+- **MoE base models supported** -- serves MoE models (Qwen3.5, DeepSeek, Mixtral) with attention-layer LoRA adapters
+- **Standard PEFT format** -- loads adapters trained with mlx-lm, mlx-tune, or any PEFT-compatible tool
+- **Engine metrics** -- TTFT, tok/s, queue depth, active sequences via `/v1/engine/metrics`
+- **Backpressure** -- returns 503 when overloaded instead of queuing unboundedly
+- **Client disconnect handling** -- cancelled requests are removed from the engine
 
 ## Quickstart
 
 ### Install
 
 ```bash
-pip install mola
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/mola.git
+git clone https://github.com/0xbstn/mola.git
 cd mola
 pip install -e ".[dev]"
 ```
@@ -74,7 +73,7 @@ mola serve \
 
 ### Query
 
-The `model` field is a **strict selector** — every value must resolve unambiguously. Unknown names return **404** instead of silently falling back to the base model, so typos are caught immediately.
+The `model` field is a **strict selector** -- unknown names return **404**, typos are caught immediately.
 
 ```bash
 # Use the "rust" adapter (base/adapter pattern)
@@ -94,19 +93,11 @@ curl http://localhost:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Optimize this slow JOIN query"}]
   }'
 
-# Base model — reserved keyword
+# Base model
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "base",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# Base model — full model path (same value returned by /health)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mlx-community/Qwen3.5-35B-A3B-4bit",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -117,7 +108,7 @@ curl http://localhost:8000/v1/chat/completions \
 # List loaded adapters
 curl http://localhost:8000/v1/adapters
 
-# Hot-load a new adapter (no restart needed)
+# Hot-load a new adapter
 curl -X POST http://localhost:8000/v1/adapters \
   -H "Content-Type: application/json" \
   -d '{"name": "medical", "path": "./adapters/medical-lora"}'
@@ -126,34 +117,34 @@ curl -X POST http://localhost:8000/v1/adapters \
 curl -X DELETE http://localhost:8000/v1/adapters/medical
 ```
 
-## How it works
-
-MOLA wraps the base model's linear layers with `MultiLoRALinear` — a drop-in replacement that holds multiple adapter weight sets and selects the right one per request.
-
-```python
-# Standard mlx-lm LoRA (single adapter, applied at load time):
-y = base_linear(x) + scale * (x @ lora_a) @ lora_b
-
-# MOLA (multiple adapters, selected per request via context):
-adapter_id = get_current_adapter()   # read from request context
-lora_a, lora_b, scale = adapters[adapter_id]
-y = base_linear(x) + scale * (x @ lora_a) @ lora_b
-```
-
-The base weights are never modified. Each adapter adds two small matrices per target layer (~50-200 MB total per adapter, depending on rank). Adapter selection uses Python's `contextvars` — no model code modifications needed.
+## Architecture
 
 ```
-Request ──► Server extracts adapter_id from "model" field
-               │
-               ▼
-            Sets adapter context (contextvars)
-               │
-               ▼
-            Forward pass: each MultiLoRALinear reads the context
-            and applies the matching adapter delta
-               │
-               ▼
-            Tokens streamed back via SSE
+HTTP request
+    │
+    ▼
+extract_adapter_id()        ─── strict model selector
+    │
+    ▼
+MOLAEngine.submit()         ─── backpressure (503 if full)
+    │
+    ▼
+┌───────────────────────────────────────────┐
+│ Engine thread (round-robin)               │
+│                                           │
+│  BatchGenerator "rust"  ◄── same-adapter  │
+│  BatchGenerator "sql"       batching      │
+│  BatchGenerator base                      │
+│                                           │
+│  model_lock ◄── prevents race with        │
+│                  adapter load/unload       │
+└───────────────────────────────────────────┘
+    │
+    ▼
+MultiLoRALinear             ─── reads adapter from contextvars
+    │                           applies the right delta per layer
+    ▼
+Tokens dispatched via async queue ──► SSE stream
 ```
 
 ## API Reference
@@ -167,11 +158,15 @@ OpenAI-compatible chat completions. Adapter selection via the `model` field:
 | `"base"` | Base model, no adapter (reserved keyword) |
 | `"mlx-community/Qwen3.5-35B-A3B-4bit"` | Base model (exact `model_path` from `/health`) |
 | `"rust"` | `rust` adapter (direct name match) |
-| `"qwen/rust"` | `rust` adapter (`base/adapter` pattern) |
-| `"qwen/typo"` | **404** — `typo` is not a loaded adapter |
-| `"sqll"` | **404** — unknown bare name (typo caught) |
+| `"qwen/rust"` | `rust` adapter (suffix-based, prefix ignored) |
+| `"qwen/typo"` | **404** -- `typo` is not a loaded adapter |
+| `"sqll"` | **404** -- unknown bare name (typo caught) |
 
 Supports `stream: true` for SSE streaming.
+
+### `GET /v1/models`
+
+OpenAI-compatible model listing. Returns `base`, model path, and all loaded adapter names. Used by clients like Msty for auto-discovery.
 
 ### `GET /v1/adapters`
 
@@ -179,15 +174,43 @@ List all loaded adapters with metadata (rank, scale, memory usage).
 
 ### `POST /v1/adapters`
 
-Hot-load a new adapter. Body: `{"name": "...", "path": "..."}`.
+Hot-load a new adapter. Body: `{"name": "...", "path": "..."}`. Adapter load/unload is synchronized with the engine via `model_lock`.
 
 ### `DELETE /v1/adapters/{name}`
 
 Unload an adapter and free its memory.
 
+### `GET /v1/engine/metrics`
+
+Engine runtime metrics:
+
+```json
+{
+  "queued_requests": 0,
+  "active_generators": 2,
+  "active_sequences": 0,
+  "total_tokens_generated": 552,
+  "requests_completed": 11,
+  "avg_ttft_ms": 53.8,
+  "avg_tps": 225.6
+}
+```
+
 ### `GET /health`
 
 Server health check with model and adapter count.
+
+## Benchmarks
+
+Measured on Qwen2.5-0.5B-Instruct-4bit with rust + sql adapters (Apple Silicon):
+
+| Scenario | conc=1 | conc=8 |
+|---|---|---|
+| Base model | 7.5 req/s, 481 tok/s | 21.7 req/s, 1388 tok/s |
+| Same adapter (rust) | 3.5 req/s, 226 tok/s | 13.6 req/s, 852 tok/s |
+| Mixed (rust+sql) | 3.5 req/s, 226 tok/s | 13.4 req/s, 542 tok/s |
+
+Same-adapter batching scales with concurrency. Mixed-adapter traffic is round-robined between per-adapter generators.
 
 ## One-shot generation (no server)
 
@@ -209,7 +232,7 @@ my-adapter/
 └── adapters.safetensors     # lora_a and lora_b weights
 ```
 
-Train adapters with [mlx-lm](https://github.com/ml-explore/mlx-lm), [mlx-tune](https://github.com/ARahim3/mlx-tune), or any tool that outputs PEFT-compatible safetensors.
+Train adapters with [mlx-lm](https://github.com/ml-explore/mlx-lm), [mlx-tune](https://github.com/ARahim3/mlx-tune), or any tool that outputs PEFT-compatible safetensors. LoRA, QLoRA -- same output format, both work.
 
 ## Requirements
 
@@ -231,29 +254,26 @@ Compare: loading 10 separate fine-tuned models would require ~180 GB.
 
 ## Limitations
 
-- **Alpha** — API contract is stable but internals may change
-- **Apple Silicon only** — requires MLX (no CUDA, no CPU fallback)
-- **KV cache** — switching adapters mid-conversation invalidates the KV cache (the conversation restarts). Each conversation should use one adapter throughout.
-- **No batching across adapters** — concurrent requests with different adapters are served sequentially (single async lock). For single-user local inference this is not a bottleneck.
-- **Strict adapter validation** — an adapter must inject into all its expected target layers. Partially compatible adapters are rejected at load time to prevent silent incorrect outputs.
-- **No custom kernels** — uses standard MLX `matmul` operations. Performance is good for local use but not optimized for high-throughput serving.
+- **Alpha** -- API contract is stable but internals may change
+- **Apple Silicon only** -- requires MLX (no CUDA, no CPU fallback)
+- **No cross-adapter batching** -- requests with different adapters are round-robined, not batched in the same forward pass. Same-adapter requests ARE batched.
+- **KV cache** -- switching adapters mid-conversation invalidates the KV cache. Each conversation should use one adapter throughout.
+- **Strict adapter validation** -- an adapter must inject into all its expected target layers. Partially compatible adapters are rejected at load time.
+- **No custom kernels** -- uses standard MLX matmul. Cross-adapter batching (S-LoRA style) would require a custom Metal kernel (BGMV equivalent).
 
 ## Roadmap
 
 - [ ] HuggingFace Hub adapter loading (load by ID, not just local path)
-- [ ] Adapter merge strategies (TIES, DARE — combine multiple adapters per request)
-- [ ] Per-adapter KV cache (avoid invalidation on switch)
 - [ ] Expert-layer LoRA for MoE models (SwitchLinear wrapping)
-- [ ] QLoRA / DoRA adapter support
-- [ ] Prometheus metrics endpoint
-- [ ] Benchmarks (latency overhead per adapter, memory scaling)
+- [ ] Cross-adapter batching via custom Metal kernel
+- [ ] DoRA adapter support
+- [ ] Per-adapter KV cache (avoid invalidation on switch)
+- [ ] Adapter merge strategies (TIES, DARE)
 
 ## Contributing
 
-MOLA is in early development. Contributions, bug reports, and feedback are welcome.
-
 ```bash
-git clone https://github.com/YOUR_USERNAME/mola.git
+git clone https://github.com/0xbstn/mola.git
 cd mola
 pip install -e ".[dev]"
 pytest
