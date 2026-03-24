@@ -50,6 +50,13 @@ def main(verbose: bool):
     is_flag=True,
     help="Fail closed on routed decode contract mismatches during experimental validation",
 )
+@click.option(
+    "--routed-decode-backend",
+    type=click.Choice(["reference", "metal-kernel"]),
+    default="reference",
+    show_default=True,
+    help="Backend used behind the routed decode session factory when routed decode is enabled",
+)
 def serve(
     model: str,
     adapter: tuple,
@@ -58,6 +65,7 @@ def serve(
     max_inflight_tokens: int,
     enable_routed_decode_reference: bool,
     strict_routed_decode_reference: bool,
+    routed_decode_backend: str,
 ):
     """Start the MOLA inference server."""
     import uvicorn
@@ -77,6 +85,7 @@ def serve(
             max_inflight_tokens=max_inflight_tokens,
             enable_routed_decode_reference=enable_routed_decode_reference,
             strict_routed_decode_reference=strict_routed_decode_reference,
+            routed_decode_backend=routed_decode_backend,
         ),
     )
 
@@ -85,6 +94,7 @@ def serve(
     click.echo(f"  Adapters: {[name for name, _ in adapter] or ['none']}")
     click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode strict: {'on' if strict_routed_decode_reference else 'off'}")
+    click.echo(f"  Routed decode backend: {routed_decode_backend}")
     click.echo()
     click.echo("Endpoints:")
     click.echo(f"  POST   http://{host}:{port}/v1/chat/completions")

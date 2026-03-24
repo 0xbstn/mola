@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from mola.adapter import AdapterSlotBinding
 from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, RoutedLayerPackState, build_layer_slot_pack_state, build_layer_slot_pack_views, materialize_layer_slot_packs
 from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPolicy
+from mola.application.routed_decode import RoutedDecodeContractError
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
 from mola.context import adapter_context, routed_decode_context
 from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
@@ -53,6 +54,7 @@ class EngineConfig:
     prefill_slot_limit: int = 1
     enable_routed_decode_reference: bool = False
     strict_routed_decode_reference: bool = False
+    routed_decode_backend: str = "reference"
 
 
 @dataclass
@@ -122,6 +124,7 @@ class EngineMetrics:
     total_insert_lock_wait_ms: float = 0.0
     routed_decode_reference_enabled: bool = False
     routed_decode_reference_strict: bool = False
+    routed_decode_backend: str = "reference"
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -147,6 +150,7 @@ class EngineMetrics:
             "total_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms, 2),
             "routed_decode_reference_enabled": self.routed_decode_reference_enabled,
             "routed_decode_reference_strict": self.routed_decode_reference_strict,
+            "routed_decode_backend": self.routed_decode_backend,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -218,6 +222,7 @@ class MOLAEngine:
         self.metrics.routed_decode_reference_strict = (
             self.config.strict_routed_decode_reference
         )
+        self.metrics.routed_decode_backend = self.config.routed_decode_backend
         self.admission_policy = TokenBudgetAdmissionPolicy(self.config.max_inflight_tokens)
         self.scheduling_policy: WaitingAwareSchedulingPolicy[str | None] = (
             WaitingAwareSchedulingPolicy()
@@ -813,10 +818,20 @@ class MOLAEngine:
         return MLXBatchGeneratorPort(*args, **kwargs)
 
     def _default_routed_decode_session_factory(self) -> RoutedLoRADeltaSessionFactory:
-        from mola.infrastructure.routed_decode import ReferenceRoutedLoRADeltaSessionFactory
+        if self.config.routed_decode_backend == "reference":
+            from mola.infrastructure.routed_decode import ReferenceRoutedLoRADeltaSessionFactory
 
-        return ReferenceRoutedLoRADeltaSessionFactory(
-            strict=self.config.strict_routed_decode_reference
+            return ReferenceRoutedLoRADeltaSessionFactory(
+                strict=self.config.strict_routed_decode_reference
+            )
+        if self.config.routed_decode_backend == "metal-kernel":
+            from mola.infrastructure.metal_routed_decode import MetalKernelRoutedLoRADeltaSessionFactory
+
+            return MetalKernelRoutedLoRADeltaSessionFactory(
+                strict=self.config.strict_routed_decode_reference
+            )
+        raise ValueError(
+            f"unsupported routed_decode_backend: {self.config.routed_decode_backend}"
         )
 
     def _get_routed_decode_session_factory(self) -> RoutedLoRADeltaSessionFactory:
@@ -871,7 +886,21 @@ class MOLAEngine:
         lock_wait_start = time.monotonic()
         with self.model_lock:
             lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
-            routed_session = self._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
+            try:
+                routed_session = self._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
+            except RoutedDecodeContractError:
+                logger.exception(
+                    "Routed decode contract error for adapter '%s'",
+                    slot.adapter_id,
+                )
+                self._fail_slot(slot, "internal error")
+                return
+            except Exception:
+                logger.exception(
+                    "Routed decode backend unavailable for adapter '%s'; falling back",
+                    slot.adapter_id,
+                )
+                routed_session = None
             t0 = time.monotonic()
             with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
                 with routed_decode_context(routed_session):

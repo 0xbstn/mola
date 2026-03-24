@@ -4,19 +4,13 @@ from dataclasses import dataclass, field
 
 import mlx.core as mx
 
-from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, RoutedDecodePlan, build_routed_decode_plan, materialize_layer_slot_packs
-from mola.application.routed_decode import RoutedDecodeContractError, resolve_routed_layer_execution
-
-
-@dataclass(frozen=True)
-class PreparedLayerExecution:
-    pack: MaterializedLayerSlotPack
-    plan: RoutedDecodePlan
+from mola.application.packing import LayerSlotPackView, materialize_layer_slot_packs
+from mola.application.routed_decode import FrozenRoutedLayerExecution, RoutedDecodeContractError, freeze_routed_layer_execution, resolve_routed_layer_execution
 
 
 @dataclass(frozen=True)
 class ReferenceRoutedLoRADeltaSession:
-    layer_executions: dict[str, PreparedLayerExecution]
+    layer_executions: dict[str, FrozenRoutedLayerExecution]
     token_slot_ids: tuple[int, ...]
     strict: bool = False
 
@@ -40,6 +34,12 @@ class ReferenceRoutedLoRADeltaSession:
             return None
 
         flat_x = x.reshape((-1, x.shape[-1]))
+        if flat_x.shape[-1] != execution.abi.input_dim:
+            if self.strict:
+                raise RoutedDecodeContractError(
+                    f"input dim mismatch for layer '{layer_name}': expected {execution.abi.input_dim}, got {flat_x.shape[-1]}"
+                )
+            return None
 
         try:
             sorted_chunks = []
@@ -60,7 +60,7 @@ class ReferenceRoutedLoRADeltaSession:
 @dataclass(frozen=True)
 class ReferenceRoutedLoRADeltaSessionFactory:
     strict: bool = False
-    _pack_cache: dict[tuple, MaterializedLayerSlotPack] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _pack_cache: dict[tuple, object] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def _cache_key(self, view: LayerSlotPackView) -> tuple:
         return (
@@ -69,7 +69,7 @@ class ReferenceRoutedLoRADeltaSessionFactory:
             tuple((id(entry.lora_a), id(entry.lora_b), entry.scale) for entry in view.entries),
         )
 
-    def _materialize_pack(self, view: LayerSlotPackView) -> MaterializedLayerSlotPack:
+    def _materialize_pack(self, view: LayerSlotPackView):
         key = self._cache_key(view)
         cached = self._pack_cache.get(key)
         if cached is not None:
@@ -88,16 +88,16 @@ class ReferenceRoutedLoRADeltaSessionFactory:
         views,
         token_slot_ids: tuple[int, ...],
     ) -> ReferenceRoutedLoRADeltaSession:
-        layer_executions: dict[str, PreparedLayerExecution] = {}
+        layer_executions: dict[str, FrozenRoutedLayerExecution] = {}
         for view in views:
             pack = self._materialize_pack(view)
             try:
-                plan = build_routed_decode_plan(pack, token_slot_ids)
-            except ValueError as exc:
+                execution = freeze_routed_layer_execution(pack, token_slot_ids)
+            except RoutedDecodeContractError:
                 if self.strict:
-                    raise RoutedDecodeContractError(str(exc)) from exc
+                    raise
                 continue
-            layer_executions[pack.layer_name] = PreparedLayerExecution(pack=pack, plan=plan)
+            layer_executions[pack.layer_name] = execution
 
         return ReferenceRoutedLoRADeltaSession(
             layer_executions,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mola.application.packing import build_layer_slot_pack_state, materialize_layer_slot_packs
+from mola.application.routed_decode import RoutedDecodeContractError
 from mola.engine import (
     AdmissionRejected,
     DecodeRowBinding,
@@ -69,6 +71,7 @@ class TestEngineMetrics:
         assert snap["total_insert_lock_wait_ms"] == 0
         assert snap["avg_ttft_ms"] == 0
         assert snap["avg_tps"] == 0
+        assert snap["routed_decode_backend"] == "reference"
 
     def test_record_completion(self):
         m = EngineMetrics()
@@ -99,6 +102,7 @@ class TestEngineMetrics:
         assert snap["total_step_lock_wait_ms"] == 0
         assert snap["total_insert_lock_wait_ms"] == 0
         assert snap["routed_decode_reference_enabled"] is False
+        assert snap["routed_decode_backend"] == "reference"
         assert snap["avg_ttft_ms"] == 0
         assert snap["avg_tps"] == 0
 
@@ -124,6 +128,44 @@ class TestEngineMetrics:
         snap = engine.metrics.snapshot()
         assert snap["routed_decode_reference_enabled"] is True
         assert snap["routed_decode_reference_strict"] is True
+
+    def test_engine_config_marks_routed_decode_backend_in_metrics(self):
+        engine = _make_engine(
+            config=EngineConfig(routed_decode_backend="metal-kernel")
+        )
+        assert engine.metrics.snapshot()["routed_decode_backend"] == "metal-kernel"
+
+
+class TestDefaultRoutedDecodeFactory:
+    def test_default_routed_decode_factory_uses_reference_backend(self, monkeypatch):
+        fake_factory = object()
+        fake_module = SimpleNamespace(
+            ReferenceRoutedLoRADeltaSessionFactory=lambda strict: fake_factory
+        )
+        monkeypatch.setitem(sys.modules, "mola.infrastructure.routed_decode", fake_module)
+        engine = _make_engine(config=EngineConfig(routed_decode_backend="reference"))
+
+        factory = engine._default_routed_decode_session_factory()
+
+        assert factory is fake_factory
+
+    def test_default_routed_decode_factory_uses_metal_backend(self, monkeypatch):
+        fake_factory = object()
+        fake_module = SimpleNamespace(
+            MetalKernelRoutedLoRADeltaSessionFactory=lambda strict: fake_factory
+        )
+        monkeypatch.setitem(sys.modules, "mola.infrastructure.metal_routed_decode", fake_module)
+        engine = _make_engine(config=EngineConfig(routed_decode_backend="metal-kernel"))
+
+        factory = engine._default_routed_decode_session_factory()
+
+        assert factory is fake_factory
+
+    def test_default_routed_decode_factory_rejects_unknown_backend(self):
+        engine = _make_engine(config=EngineConfig(routed_decode_backend="wat"))
+
+        with pytest.raises(ValueError, match="unsupported routed_decode_backend"):
+            engine._default_routed_decode_session_factory()
 
 
 class TestGetStopTokens:
@@ -195,10 +237,10 @@ class TestCancellation:
     def test_cancel_pending_slot_request(self):
         engine = _make_engine()
         q = asyncio.Queue()
-        req = GenerateRequest([1], "rust", 10, None, q)
-        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={10})
+        req = GenerateRequest([1], "active", 10, None, q)
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="active", active_uids={10})
         slot.pending_requests.append(req)
-        engine._generators["rust"] = slot
+        engine._generators["active"] = slot
 
         engine.cancel(q)
         engine._process_cancelled()
@@ -369,7 +411,7 @@ class TestAdapterSlotResolution:
         ])
 
         rust_slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={10})
-        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql")
+        sql_slot = _AdapterSlot(generator=MagicMock(), adapter_id="sql", active_uids={10})
         sql_slot.pending_requests.append(GenerateRequest([1], "sql", 10, None, asyncio.Queue()))
         engine._generators = {"rust": rust_slot, "sql": sql_slot}
         engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
@@ -1002,3 +1044,42 @@ class TestScheduling:
 
         assert engine.metrics.inflight_tokens_reserved == 0
         assert ("rust", 0) not in engine._uid_to_request
+
+
+class TestRoutedDecodeStepFailureHandling:
+    def test_step_slot_fails_slot_on_routed_contract_error(self):
+        engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1})
+        failed = []
+        engine._fail_slot = lambda target_slot, message: failed.append((target_slot, message))
+        engine._maybe_build_homogeneous_decode_routed_session_for_slot_locked = (
+            lambda target_slot: (_ for _ in ()).throw(RoutedDecodeContractError("boom"))
+        )
+
+        engine._step_slot(slot)
+
+        assert failed == [(slot, "internal error")]
+        slot.generator.step.assert_not_called()
+
+    def test_step_slot_falls_back_when_routed_backend_is_unavailable(self, monkeypatch):
+        engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1})
+        slot.generator.step.return_value = []
+        engine._maybe_build_homogeneous_decode_routed_session_for_slot_locked = (
+            lambda target_slot: (_ for _ in ()).throw(ImportError("metal unavailable"))
+        )
+        seen = []
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_routed_context(active_session):
+            seen.append(active_session)
+            yield
+
+        monkeypatch.setattr("mola.engine.routed_decode_context", fake_routed_context)
+
+        engine._step_slot(slot)
+
+        assert seen == [None]
+        slot.generator.step.assert_called_once()
