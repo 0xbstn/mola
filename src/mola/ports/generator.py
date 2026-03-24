@@ -23,6 +23,19 @@ class GenerationEvent:
     finish_reason: str | None
 
 
+@dataclass(frozen=True)
+class GeneratorState:
+    handle: GeneratorHandle
+    next_token: int
+    logprobs: object
+    max_tokens: int
+    num_tokens: int
+    cache: object
+    sampler: object | None
+    logits_processors: object
+    tokens: object
+
+
 class GeneratorPort(Protocol):
     def submit_batch(
         self, requests: Sequence[GeneratorSubmission]
@@ -34,5 +47,11 @@ class GeneratorPort(Protocol):
     def step(self) -> list[GenerationEvent]: ...
 
     def cancel(self, handles: Sequence[GeneratorHandle]) -> None: ...
+
+    def take_states(self, handles: Sequence[GeneratorHandle]) -> list[GeneratorState]: ...
+
+    def restore_states(
+        self, states: Sequence[GeneratorState]
+    ) -> list[GeneratorHandle]: ...
 
     def close(self) -> None: ...
