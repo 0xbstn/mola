@@ -114,6 +114,17 @@ class TestEngineMetrics:
         engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))
         assert engine.metrics.snapshot()["routed_decode_reference_enabled"] is True
 
+    def test_engine_config_marks_strict_routed_decode_reference_in_metrics(self):
+        engine = _make_engine(
+            config=EngineConfig(
+                enable_routed_decode_reference=True,
+                strict_routed_decode_reference=True,
+            )
+        )
+        snap = engine.metrics.snapshot()
+        assert snap["routed_decode_reference_enabled"] is True
+        assert snap["routed_decode_reference_strict"] is True
+
 
 class TestGetStopTokens:
     def test_single_eos(self):

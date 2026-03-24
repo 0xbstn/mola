@@ -45,6 +45,11 @@ def main(verbose: bool):
     is_flag=True,
     help="Enable the experimental homogeneous routed-decode reference path",
 )
+@click.option(
+    "--strict-routed-decode-reference",
+    is_flag=True,
+    help="Fail closed on routed decode contract mismatches during experimental validation",
+)
 def serve(
     model: str,
     adapter: tuple,
@@ -52,6 +57,7 @@ def serve(
     port: int,
     max_inflight_tokens: int,
     enable_routed_decode_reference: bool,
+    strict_routed_decode_reference: bool,
 ):
     """Start the MOLA inference server."""
     import uvicorn
@@ -70,6 +76,7 @@ def serve(
         EngineConfig(
             max_inflight_tokens=max_inflight_tokens,
             enable_routed_decode_reference=enable_routed_decode_reference,
+            strict_routed_decode_reference=strict_routed_decode_reference,
         ),
     )
 
@@ -77,6 +84,7 @@ def serve(
     click.echo(f"  Base model: {model}")
     click.echo(f"  Adapters: {[name for name, _ in adapter] or ['none']}")
     click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
+    click.echo(f"  Routed decode strict: {'on' if strict_routed_decode_reference else 'off'}")
     click.echo()
     click.echo("Endpoints:")
     click.echo(f"  POST   http://{host}:{port}/v1/chat/completions")

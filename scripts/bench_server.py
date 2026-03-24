@@ -81,6 +81,7 @@ class ScenarioResult:
     engine_step_lock_wait_ms: float
     engine_insert_lock_wait_ms: float
     engine_routed_decode_reference_enabled: bool
+    engine_routed_decode_reference_strict: bool
     models: list[str]
 
 
@@ -340,6 +341,9 @@ async def _run_scenario(
         engine_routed_decode_reference_enabled=bool(
             after.get("routed_decode_reference_enabled", False)
         ),
+        engine_routed_decode_reference_strict=bool(
+            after.get("routed_decode_reference_strict", False)
+        ),
         models=models,
     )
 
@@ -478,6 +482,10 @@ def _print_header(
     print(
         "Routed decode reference: "
         f"{engine_metrics.get('routed_decode_reference_enabled', False)}"
+    )
+    print(
+        "Routed decode strict: "
+        f"{engine_metrics.get('routed_decode_reference_strict', False)}"
     )
     print("Scenarios:")
     for scenario in scenarios:

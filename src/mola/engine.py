@@ -52,6 +52,7 @@ class EngineConfig:
     prefill_interval: int = 2
     prefill_slot_limit: int = 1
     enable_routed_decode_reference: bool = False
+    strict_routed_decode_reference: bool = False
 
 
 @dataclass
@@ -120,6 +121,7 @@ class EngineMetrics:
     total_step_lock_wait_ms: float = 0.0
     total_insert_lock_wait_ms: float = 0.0
     routed_decode_reference_enabled: bool = False
+    routed_decode_reference_strict: bool = False
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -144,6 +146,7 @@ class EngineMetrics:
             "total_step_lock_wait_ms": round(self.total_step_lock_wait_ms, 2),
             "total_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms, 2),
             "routed_decode_reference_enabled": self.routed_decode_reference_enabled,
+            "routed_decode_reference_strict": self.routed_decode_reference_strict,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -211,6 +214,9 @@ class MOLAEngine:
         self.metrics.token_budget_limit = self.config.max_inflight_tokens
         self.metrics.routed_decode_reference_enabled = (
             self.config.enable_routed_decode_reference
+        )
+        self.metrics.routed_decode_reference_strict = (
+            self.config.strict_routed_decode_reference
         )
         self.admission_policy = TokenBudgetAdmissionPolicy(self.config.max_inflight_tokens)
         self.scheduling_policy: WaitingAwareSchedulingPolicy[str | None] = (
@@ -805,7 +811,9 @@ class MOLAEngine:
     def _default_routed_decode_session_factory(self) -> RoutedLoRADeltaSessionFactory:
         from mola.infrastructure.routed_decode import ReferenceRoutedLoRADeltaSessionFactory
 
-        return ReferenceRoutedLoRADeltaSessionFactory()
+        return ReferenceRoutedLoRADeltaSessionFactory(
+            strict=self.config.strict_routed_decode_reference
+        )
 
     def _get_routed_decode_session_factory(self) -> RoutedLoRADeltaSessionFactory:
         if self._routed_decode_session_factory is None:

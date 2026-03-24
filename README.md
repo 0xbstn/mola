@@ -72,12 +72,15 @@ mola serve \
   --adapter sql ./adapters/sql-lora \
   --max-inflight-tokens 32768 \
   --enable-routed-decode-reference \
+  --strict-routed-decode-reference \
   --port 8000
 ```
 
 `--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request. It matters under heavy prefill load and should be tuned against available unified memory.
 
 `--enable-routed-decode-reference` turns on the current homogeneous routed-decode reference path. It is meant for controlled validation, not as the default production path yet. Live validation on March 24, 2026 showed it is slower than the default runtime on `same`, `mixed`, `fairness`, and `long-decode-mixed` workloads.
+
+`--strict-routed-decode-reference` is the fail-closed variant for backend validation. With it enabled, routed decode contract mismatches are surfaced instead of silently falling back to the default adapter path.
 
 ### Query
 
