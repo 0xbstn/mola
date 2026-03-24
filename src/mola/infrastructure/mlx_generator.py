@@ -48,6 +48,12 @@ class MLXBatchGeneratorPort(GeneratorPort):
         )
         return [GeneratorHandle(uid=uid) for uid in uids]
 
+    def active_handles(self) -> tuple[GeneratorHandle, ...]:
+        batch = self._generator.active_batch
+        if batch is None:
+            return ()
+        return tuple(GeneratorHandle(uid=uid) for uid in batch.uids)
+
     def step(self) -> list[GenerationEvent]:
         return [
             GenerationEvent(

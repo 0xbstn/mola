@@ -495,18 +495,7 @@ class TestAdapterSlotResolution:
         assert token_slot_ids == (1, 1, 1)
         assert state.get("layers.0.q_proj") is not None
 
-    def test_build_homogeneous_decode_context_handles_base_model(self):
-        engine = _make_engine()
-        state, token_slot_ids = engine.build_homogeneous_decode_context(
-            None,
-            2,
-            stack_fn=lambda values: tuple(values),
-        )
-
-        assert token_slot_ids == ()
-        assert state.get("layers.0.q_proj") is None
-
-    def test_build_decode_routed_context_for_slot_uses_active_uid_count(self):
+    def test_build_homogeneous_decode_routed_context_for_slot_uses_active_handle_order(self):
         engine = _make_engine()
         engine.mola_model.adapter_slot_bindings.return_value = [
             AdapterSlotBinding("rust", 1, 8, 16.0, 1, ("q_proj",), "/fake/rust"),
@@ -520,6 +509,11 @@ class TestAdapterSlotResolution:
             ),
         ])
         slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1, 2, 3})
+        slot.generator.active_handles.return_value = (
+            MagicMock(uid=11),
+            MagicMock(uid=12),
+            MagicMock(uid=13),
+        )
         engine._generators = {"rust": slot}
         engine.mola_model.adapter_slot_id.side_effect = lambda adapter_id: {"rust": 1}.get(adapter_id)
 
@@ -536,6 +530,20 @@ class TestAdapterSlotResolution:
     def test_build_decode_routed_context_for_slot_skips_base_slot(self):
         engine = _make_engine()
         slot = _AdapterSlot(generator=MagicMock(), adapter_id=None, active_uids={1, 2})
+        slot.generator.active_handles.return_value = (MagicMock(uid=1), MagicMock(uid=2))
+
+        state, token_slot_ids = engine._build_homogeneous_decode_routed_context_for_slot(
+            slot,
+            stack_fn=lambda values: tuple(values),
+        )
+
+        assert state is None
+        assert token_slot_ids is None
+
+    def test_build_decode_routed_context_for_slot_skips_empty_generator_batch(self):
+        engine = _make_engine()
+        slot = _AdapterSlot(generator=MagicMock(), adapter_id="rust", active_uids={1, 2})
+        slot.generator.active_handles.return_value = ()
 
         state, token_slot_ids = engine._build_homogeneous_decode_routed_context_for_slot(
             slot,

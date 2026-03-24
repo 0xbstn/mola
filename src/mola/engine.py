@@ -469,16 +469,15 @@ class MOLAEngine:
         stack_fn: Callable[[list[Any]], Any],
         scale_fn: Callable[[list[float]], Any] | None = None,
     ) -> tuple[RoutedLayerPackState | None, tuple[int, ...] | None]:
-        with self._state_lock:
-            active_count = len(slot.active_uids)
-        if active_count <= 0:
+        handles = slot.generator.active_handles()
+        if not handles:
             return None, None
         runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
         if runtime_slot_id is None:
             return None, None
         return self.build_homogeneous_decode_context(
             slot.adapter_id,
-            active_count,
+            len(handles),
             stack_fn=stack_fn,
             scale_fn=scale_fn,
         )
