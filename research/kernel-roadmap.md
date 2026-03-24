@@ -61,6 +61,23 @@ The runtime now has:
 [Inference]
 This is the right boundary to preserve before any kernel work. The next backend can replace the session implementation without changing `MultiLoRALinear` again.
 
+### 1.0.3 Live validation of the routed reference path is negative on performance
+
+On March 24, 2026, the current homogeneous routed reference path was validated live on the `Qwen2.5-0.5B-Instruct-4bit` server with eight resident adapters and `routed_decode_reference_enabled=true`.
+
+Compared to the stored `v0.3.2` baseline, the routed reference path was slower across the relevant scenarios:
+- `same @8`: `13.58 req/s` -> `10.24 req/s`
+- `mixed @8`: `4.84 req/s` -> `2.37 req/s`
+- `fairness @8`: `6.88 req/s` -> `3.63 req/s`
+- `long-decode-mixed @8`: `2.84 req/s` -> `1.41 req/s`
+- `same @16`: `18.12 req/s` -> `14.58 req/s`
+- `mixed @16`: `6.98 req/s` -> `3.62 req/s`
+- `fairness @16`: `11.20 req/s` -> `5.97 req/s`
+- `long-decode-mixed @16`: `3.92 req/s` -> `2.18 req/s`
+
+[Inference]
+This is the expected result for the current routed session path. It proves that the execution seam works and that the routed path can be exercised under load, but it does not provide a faster runtime yet. The routed reference path should therefore be treated as a correctness and ABI scaffold for the future kernel, not as a performance feature to enable by default.
+
 ### 1.1 The real bottleneck is still mixed decode
 
 From the current `v0.3.2` benchmark notes in `benchmark/0.3.2/notes.md`:
@@ -685,6 +702,7 @@ Verdict first:
 - Copy from `MetalRT`: brutal benchmark focus and minimal abstraction in the hot path.
 - Copy from `RunAnywhere`: adapter catalog, hot-swap, and stackable adapters as first-class control-plane concepts.
 - Copy from `OpenEvolve`: the compile-test-benchmark loop and checkpointed search over kernel variants.
+- Copy from `metalQwen3`: the "mostly manual, benchmark-driven" Metal workflow.
 - Ignore the product shapes that do not match MOLA: mobile SDK packaging, training UI, general inference platforms, or single-model engines without multi-LoRA routing.
 
 ## 9. Public Project Map: What Is Closest To MOLA
