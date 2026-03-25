@@ -7,11 +7,31 @@ This is the main entry point that ties everything together.
 from __future__ import annotations
 
 import logging
+from types import ModuleType
 
 from mola.adapter import Adapter, AdapterManager
 from mola.context import adapter_context
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyMLXLM:
+    def __init__(self):
+        self._module: ModuleType | None = None
+
+    def _resolve(self):
+        if self._module is None:
+            import mlx_lm as module
+
+            self._module = module
+        return self._module
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+
+mlx_lm = _LazyMLXLM()
+INTERNAL_RESERVED_ADAPTER_NAMES = {"__mixed_decode__"}
 
 
 class MOLAModel:
@@ -30,8 +50,6 @@ class MOLAModel:
     """
 
     def __init__(self, model_path: str):
-        import mlx_lm
-
         logger.info(f"Loading base model: {model_path}")
         self.model, self.tokenizer = mlx_lm.load(model_path)
         self.model_path = model_path
@@ -46,7 +64,7 @@ class MOLAModel:
         """
         from mola.lora import apply_multi_lora, eject_adapter_weights, inject_adapter_weights
 
-        _RESERVED_NAMES = {"base", self.model_path}
+        _RESERVED_NAMES = {"base", self.model_path, *INTERNAL_RESERVED_ADAPTER_NAMES}
         if name in _RESERVED_NAMES:
             raise ValueError(
                 f"Adapter name '{name}' is reserved — "
@@ -141,8 +159,6 @@ class MOLAModel:
         top_p: float = 0.9,
     ) -> str:
         """Generate text with an optional adapter."""
-        import mlx_lm
-
         sampler = self._make_sampler(temp, top_p)
         with adapter_context(adapter_id, slot_id=self.adapter_slot_id(adapter_id)):
             response = mlx_lm.generate(
@@ -163,8 +179,6 @@ class MOLAModel:
         top_p: float = 0.9,
     ):
         """Yield tokens one by one for streaming. Used by the server."""
-        import mlx_lm
-
         sampler = self._make_sampler(temp, top_p)
         with adapter_context(adapter_id, slot_id=self.adapter_slot_id(adapter_id)):
             for step in mlx_lm.stream_generate(

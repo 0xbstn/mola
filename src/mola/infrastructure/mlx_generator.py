@@ -134,7 +134,9 @@ class MLXBatchGeneratorPort(GeneratorPort):
             GeneratorHandle(uid=next_uid + index) for index in range(len(states))
         ]
 
-        token_dtype = getattr(states[0].tokens, "dtype", None)
+        token_dtype = np.int32
+        if hasattr(states[0].tokens, "tolist"):
+            token_dtype = np.asarray(states[0].tokens.tolist()).dtype
         y_values = np.array([state.next_token for state in states], dtype=token_dtype)
         batch = Batch(
             uids=[handle.uid for handle in restored_handles],

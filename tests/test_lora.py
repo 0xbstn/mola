@@ -112,6 +112,23 @@ class TestMultiLoRALinear:
 
         assert mx.allclose(y, y_base)
 
+    def test_routed_decode_skips_wrapped_layers_without_any_bound_slots(self):
+        class _Session:
+            def delta(self, layer_name, x):
+                raise AssertionError(f"routed session should not run for {layer_name}")
+
+        layer = MultiLoRALinear(
+            nn.Linear(8, 4),
+            layer_name="model.layers.0.self_attn.q_proj",
+        )
+        x = mx.ones((1, 8))
+        y_base = layer(x)
+        with adapter_context(None, slot_id=None):
+            with routed_decode_context(_Session()):
+                y = layer(x)
+
+        assert mx.allclose(y, y_base)
+
     def test_remove_adapter(self):
         layer = self._make_layer()
         lora_a = mx.ones((8, 2)) * 0.1
@@ -354,3 +371,5 @@ class TestLoadAdapterRollback:
             mola.load_adapter("base", "/fake")
         with pytest.raises(ValueError, match="reserved"):
             mola.load_adapter("test-model", "/fake")
+        with pytest.raises(ValueError, match="reserved"):
+            mola.load_adapter("__mixed_decode__", "/fake")

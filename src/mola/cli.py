@@ -57,6 +57,11 @@ def main(verbose: bool):
     show_default=True,
     help="Backend used behind the routed decode session factory when routed decode is enabled",
 )
+@click.option(
+    "--enable-mixed-decode-migration",
+    is_flag=True,
+    help="Experimentally migrate decode-ready adapted requests into a shared mixed decode generator",
+)
 def serve(
     model: str,
     adapter: tuple,
@@ -66,6 +71,7 @@ def serve(
     enable_routed_decode_reference: bool,
     strict_routed_decode_reference: bool,
     routed_decode_backend: str,
+    enable_mixed_decode_migration: bool,
 ):
     """Start the MOLA inference server."""
     import uvicorn
@@ -86,6 +92,7 @@ def serve(
             enable_routed_decode_reference=enable_routed_decode_reference,
             strict_routed_decode_reference=strict_routed_decode_reference,
             routed_decode_backend=routed_decode_backend,
+            enable_mixed_decode_migration=enable_mixed_decode_migration,
         ),
     )
 
@@ -95,6 +102,7 @@ def serve(
     click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode strict: {'on' if strict_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode backend: {routed_decode_backend}")
+    click.echo(f"  Mixed decode migration: {'on' if enable_mixed_decode_migration else 'off'}")
     click.echo()
     click.echo("Endpoints:")
     click.echo(f"  POST   http://{host}:{port}/v1/chat/completions")

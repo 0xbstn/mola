@@ -83,6 +83,7 @@ class ScenarioResult:
     engine_routed_decode_reference_enabled: bool
     engine_routed_decode_reference_strict: bool
     engine_routed_decode_backend: str
+    engine_mixed_decode_migration_enabled: bool
     models: list[str]
 
 
@@ -347,6 +348,9 @@ async def _run_scenario(
         ),
         engine_routed_decode_backend=str(
             after.get("routed_decode_backend", "reference")
+        ),
+        engine_mixed_decode_migration_enabled=bool(
+            after.get("mixed_decode_migration_enabled", False)
         ),
         models=models,
     )

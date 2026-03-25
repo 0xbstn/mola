@@ -21,13 +21,14 @@ from mola.engine import (
     EngineConfig,
     EngineMetrics,
     GenerateRequest,
+    MIXED_DECODE_ADAPTER_ID,
     MOLAEngine,
     RuntimeSlotLayout,
     _AdapterSlot,
     _get_stop_tokens,
 )
 from mola.adapter import AdapterSlotBinding
-from mola.ports.generator import GeneratorHandle
+from mola.ports.generator import GeneratorHandle, GeneratorState
 
 
 def _tuple_routed_session_factory():
@@ -1034,6 +1035,182 @@ class TestUidNamespacing:
 
         slot.generator.cancel.assert_called_once_with([GeneratorHandle(uid=0)])
         assert ("adapted", 0) not in engine._uid_to_request
+
+
+class TestMixedDecodeMigration:
+    def test_migrate_decode_ready_request_moves_state_to_shared_slot(self):
+        engine = _make_engine(
+            config=EngineConfig(
+                enable_routed_decode_reference=True,
+                enable_mixed_decode_migration=True,
+            )
+        )
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        source_generator = MagicMock()
+        source_generator.active_handles.return_value = (GeneratorHandle(uid=7),)
+        source_generator.take_states.return_value = [
+            GeneratorState(
+                handle=GeneratorHandle(uid=7),
+                next_token=101,
+                logprobs="lp",
+                max_tokens=10,
+                num_tokens=1,
+                cache=["cache"],
+                sampler=None,
+                logits_processors=[],
+                tokens=[1, 2, 3],
+            )
+        ]
+        source_slot = _AdapterSlot(
+            generator=source_generator,
+            adapter_id="rust",
+            active_uids={7},
+        )
+        shared_generator = MagicMock()
+        shared_generator.restore_states.return_value = [GeneratorHandle(uid=70)]
+        shared_slot = _AdapterSlot(
+            generator=shared_generator,
+            adapter_id=MIXED_DECODE_ADAPTER_ID,
+            generator_key=MIXED_DECODE_ADAPTER_ID,
+            active_uids={99},
+        )
+        engine._uid_to_request[("rust", 7)] = req
+        engine._generators[MIXED_DECODE_ADAPTER_ID] = shared_slot
+        engine._get_or_create_mixed_decode_slot = lambda: shared_slot
+
+        engine._migrate_decode_ready_from_slot(source_slot)
+
+        source_generator.take_states.assert_called_once()
+        shared_generator.restore_states.assert_called_once()
+        assert source_slot.active_uids == set()
+        assert shared_slot.active_uids == {70, 99}
+        assert req.uid == 70
+        assert ("rust", 7) not in engine._uid_to_request
+        assert (MIXED_DECODE_ADAPTER_ID, 70) in engine._uid_to_request
+
+    def test_does_not_migrate_single_decode_ready_slot_without_mixed_opportunity(self):
+        engine = _make_engine(
+            config=EngineConfig(
+                enable_routed_decode_reference=True,
+                enable_mixed_decode_migration=True,
+            )
+        )
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        source_generator = MagicMock()
+        source_generator.active_handles.return_value = (GeneratorHandle(uid=7),)
+        source_slot = _AdapterSlot(
+            generator=source_generator,
+            adapter_id="rust",
+            active_uids={7},
+        )
+        engine._uid_to_request[("rust", 7)] = req
+        engine._generators["rust"] = source_slot
+
+        engine._migrate_decode_ready_from_slot(source_slot)
+
+        source_generator.take_states.assert_not_called()
+        assert source_slot.active_uids == {7}
+        assert ("rust", 7) in engine._uid_to_request
+
+    def test_restore_failure_rebinds_request_back_to_source_generator(self):
+        engine = _make_engine(
+            config=EngineConfig(
+                enable_routed_decode_reference=True,
+                enable_mixed_decode_migration=True,
+            )
+        )
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        source_generator = MagicMock()
+        source_generator.active_handles.return_value = (GeneratorHandle(uid=7),)
+        source_generator.take_states.return_value = [
+            GeneratorState(
+                handle=GeneratorHandle(uid=7),
+                next_token=101,
+                logprobs="lp",
+                max_tokens=10,
+                num_tokens=1,
+                cache=["cache"],
+                sampler=None,
+                logits_processors=[],
+                tokens=[1, 2, 3],
+            )
+        ]
+        source_generator.restore_states.return_value = [GeneratorHandle(uid=17)]
+        source_slot = _AdapterSlot(
+            generator=source_generator,
+            adapter_id="rust",
+            active_uids={7},
+        )
+        shared_generator = MagicMock()
+        shared_generator.restore_states.side_effect = RuntimeError("boom")
+        shared_slot = _AdapterSlot(
+            generator=shared_generator,
+            adapter_id=MIXED_DECODE_ADAPTER_ID,
+            generator_key=MIXED_DECODE_ADAPTER_ID,
+            active_uids={99},
+        )
+        engine._uid_to_request[("rust", 7)] = req
+        engine._generators[MIXED_DECODE_ADAPTER_ID] = shared_slot
+        engine._get_or_create_mixed_decode_slot = lambda: shared_slot
+
+        with pytest.raises(RuntimeError, match="boom"):
+            engine._migrate_decode_ready_from_slot(source_slot)
+
+        source_generator.restore_states.assert_called_once()
+        assert source_slot.active_uids == {17}
+        assert req.uid == 17
+        assert ("rust", 7) not in engine._uid_to_request
+        assert ("rust", 17) in engine._uid_to_request
+
+    def test_decode_row_bindings_expand_shared_slot_requests(self):
+        engine = _make_engine()
+        shared_generator = MagicMock()
+        shared_generator.active_handles.return_value = (
+            GeneratorHandle(uid=70),
+            GeneratorHandle(uid=71),
+        )
+        shared_slot = _AdapterSlot(
+            generator=shared_generator,
+            adapter_id=MIXED_DECODE_ADAPTER_ID,
+            generator_key=MIXED_DECODE_ADAPTER_ID,
+            active_uids={70, 71},
+        )
+        rust_req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        sql_req = GenerateRequest([2], "sql", 10, None, asyncio.Queue())
+        engine._uid_to_request[(MIXED_DECODE_ADAPTER_ID, 70)] = rust_req
+        engine._uid_to_request[(MIXED_DECODE_ADAPTER_ID, 71)] = sql_req
+        engine._ordered_slots = lambda: [shared_slot]
+        engine.mola_model.adapter_slot_id.side_effect = (
+            lambda adapter_id: {"rust": 1, "sql": 2}.get(adapter_id)
+        )
+
+        bindings = engine.decode_row_bindings()
+
+        assert bindings == (
+            DecodeRowBinding("rust", 1, 70),
+            DecodeRowBinding("sql", 2, 71),
+        )
+
+    def test_step_slot_does_not_kill_engine_on_migration_failure(self):
+        engine = _make_engine(
+            config=EngineConfig(enable_mixed_decode_migration=True)
+        )
+        slot = _AdapterSlot(
+            generator=MagicMock(),
+            adapter_id="rust",
+            active_uids={7},
+        )
+        slot.generator.step.return_value = []
+        engine._migrate_decode_ready_from_slot = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+
+        engine._step_slot(slot)
+
+        engine._migrate_decode_ready_from_slot.assert_called_once_with(slot)
 
 
 class TestScheduling:
