@@ -4,21 +4,27 @@ import importlib.util
 from pathlib import Path
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "devtools" / "run_mola_winner.py"
-SPEC = importlib.util.spec_from_file_location("run_mola_winner", SCRIPT_PATH)
+SCRIPT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "devtools"
+    / "run_mola_current_architecture.py"
+)
+SPEC = importlib.util.spec_from_file_location(
+    "run_mola_current_architecture", SCRIPT_PATH
+)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def test_parse_args_defaults_to_winner_profile() -> None:
+def test_parse_args_defaults_to_current_architecture_profile() -> None:
     args = MODULE.parse_args(["start"])
     assert args.max_inflight_tokens == 131072
     assert args.max_batch_size == 128
     assert args.prefill_batch_size == 32
 
 
-def test_build_command_contains_winner_flags() -> None:
+def test_build_command_contains_current_architecture_flags() -> None:
     args = MODULE.parse_args(["start", "--port", "8001"])
     cmd, log_path = MODULE.build_command(args)
     assert cmd[:4] == [str(MODULE.PYTHON), "-m", "mola.cli", "-v"]
@@ -32,4 +38,4 @@ def test_build_command_contains_winner_flags() -> None:
     assert "--max-inflight-tokens" in cmd
     assert "--max-batch-size" in cmd
     assert "--prefill-batch-size" in cmd
-    assert log_path == Path("/tmp/mola-winner-8001.log")
+    assert log_path == Path("/tmp/mola-current-architecture-8001.log")

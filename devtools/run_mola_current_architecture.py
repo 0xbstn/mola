@@ -109,7 +109,11 @@ def apply_patch_if_needed() -> int:
 
 
 def build_command(args: argparse.Namespace) -> tuple[list[str], Path]:
-    log_path = Path(args.log) if args.log else Path(f"/tmp/mola-winner-{args.port}.log")
+    log_path = (
+        Path(args.log)
+        if args.log
+        else Path(f"/tmp/mola-current-architecture-{args.port}.log")
+    )
     cmd = [
         str(PYTHON),
         "-m",
@@ -158,16 +162,22 @@ def start_server(args: argparse.Namespace) -> int:
         )
     time.sleep(2.0)
     if proc.poll() is not None:
-        print(f"Winner failed to start; recent log from {log_path}:", file=sys.stderr)
+        print(
+            f"Current architecture server failed to start; recent log from {log_path}:",
+            file=sys.stderr,
+        )
         try:
             print(log_path.read_text()[-8000:], file=sys.stderr)
         except Exception:
             pass
         return 1
     if not wait_for_http(args.port):
-        print(f"Winner did not become healthy on port {args.port}; see {log_path}", file=sys.stderr)
+        print(
+            f"Current architecture server did not become healthy on port {args.port}; see {log_path}",
+            file=sys.stderr,
+        )
         return 1
-    print(f"Started MOLA winner on port {args.port}")
+    print(f"Started MOLA current architecture on port {args.port}")
     print(f"PID: {proc.pid}")
     print(f"Log: {log_path}")
     return 0
@@ -183,7 +193,11 @@ def status_server(port: int) -> int:
 
 
 def logs(path: str | None, port: int) -> int:
-    log_path = Path(path) if path else Path(f"/tmp/mola-winner-{port}.log")
+    log_path = (
+        Path(path)
+        if path
+        else Path(f"/tmp/mola-current-architecture-{port}.log")
+    )
     if not log_path.exists():
         print(f"Missing log file: {log_path}", file=sys.stderr)
         return 1

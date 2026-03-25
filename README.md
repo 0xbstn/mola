@@ -28,7 +28,7 @@ Switch between adapters: instant.
 Same-adapter requests: batched.
 ```
 
-> **Status:** Alpha. The current architecture winner is now the detached shared decode owner runtime on top of the reproducible `mlx-lm` detached-batch patch, with `metal-gather` as the best routed compute backend. Same-adapter and mixed-adapter serving are both stable. The routed decode reference path remains a correctness scaffold, not the default fast path. Tested on `mlx-lm 0.31.1`.
+> **Status:** Alpha. The current architecture is the detached shared decode owner runtime on top of the reproducible `mlx-lm` detached-batch patch, with `metal-gather` as the current routed compute backend. Same-adapter and mixed-adapter serving are both stable. The routed decode reference path remains a correctness scaffold, not the default fast path. Tested on `mlx-lm 0.31.1`.
 
 ## Why
 
@@ -50,8 +50,8 @@ MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory unt
 - **Token-budget admission control** -- `--max-inflight-tokens` limits total in-flight work using `prompt_tokens + max_tokens`
 - **Engine metrics** -- TTFT, tok/s, queue depth, active sequences, and lock-wait counters via `/v1/engine/metrics`
 - **Experimental routed decode reference** -- `--enable-routed-decode-reference` prepares a homogeneous decode-only routed LoRA path for pre-kernel validation; it is a correctness/reference path, not a faster runtime path today
-- **Detached shared decode owner** -- the current winner architecture centralizes mixed decode ownership behind `DecodeOwner` instead of leaving decode fully generator-owned
-- **Reproducible `mlx-lm` patch flow** -- winner runtime is reproducible via a tracked patcher and tracked launcher instead of manual edits
+- **Detached shared decode owner** -- the current architecture centralizes mixed decode ownership behind `DecodeOwner` instead of leaving decode fully generator-owned
+- **Reproducible `mlx-lm` patch flow** -- the current architecture is reproducible via a tracked patcher and tracked launcher instead of manual edits
 - **Backpressure** -- returns 503 when overloaded instead of queuing unboundedly
 - **Client disconnect handling** -- cancelled requests are removed from the engine
 
@@ -68,9 +68,9 @@ python3 -m venv .venv
 ./.venv/bin/python devtools/apply_mlx_lm_detached_batch_api.py
 ```
 
-### Winner Current Architecture
+### Current Architecture
 
-The current architecture winner is:
+The current architecture is:
 
 - detached shared decode owner
 - public detached-batch API patched into local `mlx-lm`
@@ -78,11 +78,11 @@ The current architecture winner is:
 - mixed decode migration + pre-step migration
 - routed session caching
 
-This is the exact reproducible winner launcher:
+This is the exact reproducible launcher:
 
 ```bash
 cd mola
-./.venv/bin/python devtools/run_mola_winner.py start --port 8000
+./.venv/bin/python devtools/run_mola_current_architecture.py start --port 8000
 ```
 
 Equivalent explicit server command:
@@ -111,24 +111,24 @@ Equivalent explicit server command:
   --port 8000
 ```
 
-To stop or restart the winner:
+To stop or restart the current architecture:
 
 ```bash
-./.venv/bin/python devtools/run_mola_winner.py stop --port 8000
-./.venv/bin/python devtools/run_mola_winner.py restart --port 8000
+./.venv/bin/python devtools/run_mola_current_architecture.py stop --port 8000
+./.venv/bin/python devtools/run_mola_current_architecture.py restart --port 8000
 ```
 
 ### Serve
 
 ```bash
-./.venv/bin/python devtools/run_mola_winner.py start --port 8000
+./.venv/bin/python devtools/run_mola_current_architecture.py start --port 8000
 ```
 
 `--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request. It matters under heavy prefill load and should be tuned against available unified memory.
 
-`devtools/run_mola_winner.py` first applies the tracked `mlx-lm` detached-batch patch if needed, then starts the current winner configuration.
+`devtools/run_mola_current_architecture.py` first applies the tracked `mlx-lm` detached-batch patch if needed, then starts the recommended setup.
 
-`--enable-routed-decode-reference` still turns on the routed decode validation seam, but in the current winner architecture it is paired with the `metal-gather` backend and the detached decode owner runtime.
+`--enable-routed-decode-reference` still turns on the routed decode validation seam, but in the current architecture it is paired with the `metal-gather` backend and the detached decode owner runtime.
 
 `--strict-routed-decode-reference` is the fail-closed variant for backend validation. With it enabled, routed decode contract mismatches are surfaced instead of silently falling back to the default adapter path.
 
@@ -219,7 +219,7 @@ OpenAI-compatible chat completions. Adapter selection via the `model` field:
 | Model field | Behavior |
 |---|---|
 | `"base"` | Base model, no adapter (reserved keyword) |
-| `"mlx-community/Qwen3.5-35B-A3B-4bit"` | Base model (exact `model_path` from `/health`) |
+| `"mlx-community/Qwen2.5-0.5B-Instruct-4bit"` | Base model (exact `model_path` from `/health`) |
 | `"rust"` | `rust` adapter (direct name match) |
 | `"qwen/rust"` | `rust` adapter (suffix-based, prefix ignored) |
 | `"qwen/typo"` | **404** -- `typo` is not a loaded adapter |
@@ -270,14 +270,14 @@ Server health check with model and adapter count.
 
 ## Benchmarks
 
-Canonical current-architecture benchmark:
+Reference benchmark:
 
 ```bash
 ./.venv/bin/python scripts/bench_server.py \
   --routed-validation \
   --concurrency 64,128 \
   --repeats 3 \
-  --json-out benchmark/current-architecture-winner-routed-validation-r3.json
+  --json-out benchmark/current-architecture-reference-routed-validation-r3.json
 ```
 
 Measured on `mlx-community/Qwen2.5-0.5B-Instruct-4bit` with 8 resident adapters on Apple Silicon:
@@ -289,14 +289,14 @@ Measured on `mlx-community/Qwen2.5-0.5B-Instruct-4bit` with 8 resident adapters 
 | Long decode mixed | 12.2 req/s, 1752.8 tok/s, p95 5290.1 ms | 13.4 req/s, 1996.5 tok/s, p95 9425.9 ms |
 | Fairness | 29.7 req/s, 1533.4 tok/s, p95 2184.8 ms | 28.4 req/s, 1472.7 tok/s, p95 4346.7 ms |
 
-Key ratios on the winner:
+Key ratios on the current architecture:
 
 - `mixed / same @64` ≈ `0.83`
 - `mixed / same @128` ≈ `0.84`
 
 Benchmark artifact committed in the repo:
 
-- [current-architecture-winner-routed-validation-r3.json](/Users/bastienbouge/Documents/dev/mola/benchmark/current-architecture-winner-routed-validation-r3.json)
+- [current-architecture-reference-routed-validation-r3.json](/Users/bastienbouge/Documents/dev/mola/benchmark/current-architecture-reference-routed-validation-r3.json)
 
 ## One-shot generation (no server)
 
@@ -342,20 +342,20 @@ Compare: loading 10 separate fine-tuned models would require ~180 GB.
 
 - **Alpha** -- API contract is stable but internals may change
 - **Apple Silicon only** -- requires MLX (no CUDA, no CPU fallback)
-- **Local `mlx-lm` patch required** -- the current winner depends on a reproducible local patch to `mlx_lm.generate.BatchGenerator`; this is scripted, but not upstreamed yet
-- **Mixed prefill is not solved** -- the current winner broadens mixed decode materially, but prefill/KV ownership is still not a first-class subsystem
+- **Local `mlx-lm` patch required** -- the current architecture depends on a reproducible local patch to `mlx_lm.generate.BatchGenerator`; this is scripted, but not upstreamed yet
+- **Mixed prefill is not solved** -- the current architecture broadens mixed decode materially, but prefill/KV ownership is still not a first-class subsystem
 - **No paged KV / residency controller yet** -- adapter+KV ownership, paged base KV, and deeper prefill-owner work remain future architecture work
 - **KV cache** -- switching adapters mid-conversation invalidates the KV cache. Each conversation should use one adapter throughout.
 - **Strict adapter validation** -- an adapter must inject into all its expected target layers. Partially compatible adapters are rejected at load time.
-- **Still not a CUDA-class multi-LoRA engine** -- this winner uses routed MLX ops and a detached decode owner; it is materially better than the older generator-owned runtime, but it is not yet a paged-KV heterogeneous scheduler like vLLM/S-LoRA-class systems.
+- **Still not a CUDA-class multi-LoRA engine** -- this current architecture uses routed MLX ops and a detached decode owner; it is materially better than the older generator-owned runtime, but it is not yet a paged-KV heterogeneous scheduler like vLLM/S-LoRA-class systems.
 
 ## What Is Merged vs Lab
 
-Merged in this current architecture candidate:
+Included in this current architecture release:
 
 - detached shared decode owner runtime
 - reproducible `mlx-lm` detached-batch patch flow
-- `metal-gather` as the current routed backend winner
+- `metal-gather` as the current routed backend
 - reproducible launcher and canonical benchmark command
 
 Kept out of this merge candidate:
