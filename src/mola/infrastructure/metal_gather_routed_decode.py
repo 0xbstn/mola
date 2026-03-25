@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 
 import mlx.core as mx
 
@@ -10,6 +11,17 @@ from mola.application.routed_decode import (
     RoutedDecodeContractError,
     freeze_routed_layer_execution,
     resolve_routed_layer_execution,
+)
+
+
+logger = logging.getLogger(__name__)
+
+_METAL_LAYER_SUFFIXES = (
+    ".q_proj",
+    ".k_proj",
+    ".v_proj",
+    ".o_proj",
+    ".down_proj",
 )
 
 
@@ -77,8 +89,14 @@ class MetalGatherRoutedLoRADeltaSession:
             return mx.float32
         return dtype
 
-    def _should_use_metal(self, execution: FrozenRoutedLayerExecution) -> bool:
+    def _should_use_metal(
+        self,
+        layer_name: str,
+        execution: FrozenRoutedLayerExecution,
+    ) -> bool:
         return (
+            layer_name.endswith(_METAL_LAYER_SUFFIXES)
+            and
             execution.abi.output_dim <= 1024
             and execution.abi.rank * 128 <= 1024
         )
@@ -190,11 +208,17 @@ class MetalGatherRoutedLoRADeltaSession:
                 delta = execution.pack.scales[pack_row] * delta
                 return delta.reshape(tuple(x.shape[:-1]) + (delta.shape[-1],))
 
-            delta = (
-                self._metal_delta(flat_x, execution, layer_name)
-                if self._should_use_metal(execution)
-                else self._gather_delta(flat_x, execution)
-            )
+            if self._should_use_metal(layer_name, execution) and self.kernel is not None:
+                try:
+                    delta = self._metal_delta(flat_x, execution, layer_name)
+                except Exception:
+                    logger.exception(
+                        "metal-gather kernel unavailable for layer '%s'; falling back to gather-mm",
+                        layer_name,
+                    )
+                    delta = self._gather_delta(flat_x, execution)
+            else:
+                delta = self._gather_delta(flat_x, execution)
             return delta.reshape(tuple(x.shape[:-1]) + (delta.shape[-1],))
         except ValueError as exc:
             if self.strict:
@@ -209,6 +233,7 @@ class MetalGatherRoutedLoRADeltaSessionFactory:
         default_factory=dict, init=False, repr=False, compare=False
     )
     _kernel: object | None = field(default=None, init=False, repr=False, compare=False)
+    _kernel_unavailable: bool = field(default=False, init=False, repr=False, compare=False)
 
     def _cache_key(self, view: LayerSlotPackView) -> tuple:
         return (
@@ -235,14 +260,23 @@ class MetalGatherRoutedLoRADeltaSessionFactory:
         return pack
 
     def _get_kernel(self):
+        if self._kernel_unavailable:
+            return None
         if self._kernel is None:
-            self._kernel = mx.fast.metal_kernel(
-                name="mola_routed_lora_delta_metal_gather_v1",
-                input_names=["x", "a", "b", "scales", "slot_rows"],
-                output_names=["out"],
-                source=_METAL_GATHER_MIXED_SOURCE,
-                ensure_row_contiguous=True,
-            )
+            try:
+                self._kernel = mx.fast.metal_kernel(
+                    name="mola_routed_lora_delta_metal_gather_v1",
+                    input_names=["x", "a", "b", "scales", "slot_rows"],
+                    output_names=["out"],
+                    source=_METAL_GATHER_MIXED_SOURCE,
+                    ensure_row_contiguous=True,
+                )
+            except Exception:
+                logger.exception(
+                    "metal-gather kernel creation failed; falling back to gather-mm"
+                )
+                self._kernel_unavailable = True
+                return None
         return self._kernel
 
     def build(

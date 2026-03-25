@@ -38,6 +38,29 @@ def _view():
     )
 
 
+def _gate_view():
+    return LayerSlotPackView(
+        layer_name="layers.0.gate_proj",
+        slot_ids=(1, 2),
+        entries=(
+            LayerSlotPackEntry(
+                adapter_name="rust",
+                slot_id=1,
+                lora_a=np.array([[1.0], [0.0]]),
+                lora_b=np.array([[2.0, 3.0]]),
+                scale=2.0,
+            ),
+            LayerSlotPackEntry(
+                adapter_name="sql",
+                slot_id=2,
+                lora_a=np.array([[0.0], [1.0]]),
+                lora_b=np.array([[4.0, 1.0]]),
+                scale=0.5,
+            ),
+        ),
+    )
+
+
 def _wide_view():
     return LayerSlotPackView(
         layer_name="layers.0.up_proj",
@@ -78,7 +101,7 @@ def _expected(view, token_slot_ids, x):
     )
 
 
-def _load_backend_module(monkeypatch):
+def _load_backend_module(monkeypatch, *, kernel_raises: bool = False):
     gather_calls = []
     kernel_calls = []
 
@@ -107,6 +130,11 @@ def _load_backend_module(monkeypatch):
             rows.append(scales[slot_row] * ((x[row] @ a[slot_row]) @ b[slot_row]))
         return [np.stack(rows, axis=0).astype(output_dtypes[0])]
 
+    def load_kernel(**kwargs):
+        if kernel_raises:
+            raise RuntimeError("no metal")
+        return fake_kernel
+
     mlx_pkg = ModuleType("mlx")
     core_mod = ModuleType("mlx.core")
     core_mod.array = lambda values, dtype=None: np.array(values, dtype=dtype)
@@ -119,7 +147,7 @@ def _load_backend_module(monkeypatch):
     core_mod.bfloat16 = "bfloat16"
     core_mod.float32 = np.dtype("float32")
     core_mod.int32 = np.int32
-    core_mod.fast = SimpleNamespace(metal_kernel=lambda **kwargs: fake_kernel)
+    core_mod.fast = SimpleNamespace(metal_kernel=load_kernel)
     mlx_pkg.core = core_mod
     monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
     monkeypatch.setitem(sys.modules, "mlx.core", core_mod)
@@ -174,4 +202,32 @@ class TestMetalGatherRoutedDecodeBackend:
 
         assert np.allclose(delta, _expected(_wide_view(), (2, 1, 2), x))
         assert gather_calls == [[1, 0, 1], [1, 0, 1]]
+        assert kernel_calls == []
+
+    def test_gate_proj_stays_on_gather_even_when_small(self, monkeypatch):
+        module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
+        factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
+        token_slot_ids = tuple(([2, 1] * 8))
+        session = factory.build((_gate_view(),), token_slot_ids)
+        x = np.tile(np.array([[10.0, 1.0], [2.0, 5.0]], dtype=np.float32), (8, 1))
+
+        delta = session.delta("layers.0.gate_proj", x)
+
+        assert np.allclose(delta, _expected(_gate_view(), token_slot_ids, x))
+        assert gather_calls == [[1, 0] * 8, [1, 0] * 8]
+        assert kernel_calls == []
+
+    def test_kernel_creation_failure_falls_back_to_gather(self, monkeypatch):
+        module, gather_calls, kernel_calls = _load_backend_module(
+            monkeypatch, kernel_raises=True
+        )
+        factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
+        token_slot_ids = tuple(([2, 1] * 8))
+        session = factory.build((_view(),), token_slot_ids)
+        x = np.tile(np.array([[10.0, 1.0], [2.0, 5.0]], dtype=np.float32), (8, 1))
+
+        delta = session.delta("layers.0.q_proj", x)
+
+        assert np.allclose(delta, _expected(_view(), token_slot_ids, x))
+        assert gather_calls == [[1, 0] * 8, [1, 0] * 8]
         assert kernel_calls == []

@@ -17,7 +17,7 @@ from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPo
 from mola.application.routed_decode import RoutedDecodeContractError
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
 from mola.context import adapter_context, routed_decode_context
-from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
+from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorState, GeneratorSubmission
 from mola.ports.routed_decode import RoutedLoRADeltaSession, RoutedLoRADeltaSessionFactory
 
 if TYPE_CHECKING:
@@ -1139,6 +1139,126 @@ class MOLAEngine:
             len(shared_slot.active_uids),
         )
 
+    def _restore_mixed_decode_slot_to_source_generators(
+        self,
+        slot: _AdapterSlot,
+    ) -> bool:
+        if slot.adapter_id != MIXED_DECODE_ADAPTER_ID:
+            return False
+
+        handles = [
+            handle
+            for handle in slot.generator.active_handles()
+            if handle.uid in slot.active_uids
+        ]
+        if not handles:
+            return True
+
+        states = slot.generator.take_states(handles)
+        if not states:
+            return True
+
+        handle_reqs: list[GenerateRequest] = []
+        with self._state_lock:
+            for handle in handles:
+                req = self._uid_to_request.get(self._slot_request_key(slot, handle.uid))
+                if req is None or req.adapter_id is None:
+                    logger.error(
+                        "mixed decode restore missing request binding for uid=%s",
+                        handle.uid,
+                    )
+                    rollback_handles = slot.generator.restore_states(states)
+                    for old_handle, rollback_handle in zip(
+                        handles, rollback_handles, strict=True
+                    ):
+                        req = self._uid_to_request.pop(
+                            self._slot_request_key(slot, old_handle.uid), None
+                        )
+                        if req is None:
+                            continue
+                        slot.active_uids.discard(old_handle.uid)
+                        req.uid = rollback_handle.uid
+                        self._uid_to_request[
+                            self._slot_request_key(slot, rollback_handle.uid)
+                        ] = req
+                        slot.active_uids.add(rollback_handle.uid)
+                    self._update_sequence_count_locked()
+                    return False
+                handle_reqs.append(req)
+
+        groups: dict[str, list[tuple[GeneratorState, GenerateRequest]]] = {}
+        for state, req in zip(states, handle_reqs, strict=True):
+            assert req.adapter_id is not None
+            groups.setdefault(req.adapter_id, []).append((state, req))
+
+        restored_groups: list[
+            tuple[_AdapterSlot, list[tuple[GeneratorState, GenerateRequest]], list[GeneratorHandle]]
+        ] = []
+        try:
+            for adapter_id, entries in groups.items():
+                source_slot = self._get_or_create_slot(adapter_id)
+                restored_handles = source_slot.generator.restore_states(
+                    [state for state, _ in entries]
+                )
+                restored_groups.append((source_slot, entries, restored_handles))
+        except Exception:
+            logger.exception("mixed decode restore to source generators failed")
+            for source_slot, _entries, restored_handles in restored_groups:
+                try:
+                    source_slot.generator.take_states(restored_handles)
+                except Exception:
+                    logger.exception(
+                        "mixed decode rollback cleanup failed for adapter '%s'",
+                        source_slot.adapter_id,
+                    )
+            try:
+                rollback_handles = slot.generator.restore_states(states)
+            except Exception:
+                logger.exception("mixed decode rollback to shared slot failed")
+                return False
+            with self._state_lock:
+                for old_handle, rollback_handle, req in zip(
+                    handles, rollback_handles, handle_reqs, strict=True
+                ):
+                    self._uid_to_request.pop(
+                        self._slot_request_key(slot, old_handle.uid), None
+                    )
+                    slot.active_uids.discard(old_handle.uid)
+                    req.uid = rollback_handle.uid
+                    self._uid_to_request[
+                        self._slot_request_key(slot, rollback_handle.uid)
+                    ] = req
+                    slot.active_uids.add(rollback_handle.uid)
+                self._update_sequence_count_locked()
+            return False
+
+        now = time.time()
+        with self._state_lock:
+            for old_handle in handles:
+                self._uid_to_request.pop(self._slot_request_key(slot, old_handle.uid), None)
+                slot.active_uids.discard(old_handle.uid)
+            if not slot.active_uids and not slot.pending_requests:
+                slot.service_debt = 0.0
+            for source_slot, entries, restored_handles in restored_groups:
+                for (_state, req), restored_handle in zip(
+                    entries, restored_handles, strict=True
+                ):
+                    req.uid = restored_handle.uid
+                    self._uid_to_request[
+                        self._slot_request_key(source_slot, restored_handle.uid)
+                    ] = req
+                    source_slot.active_uids.add(restored_handle.uid)
+                    source_slot.last_active = now
+                    source_slot.last_service_ts = now
+            self.metrics.active_generators = self._generator_count_locked()
+            self._update_sequence_count_locked()
+        logger.debug(
+            "mixed_decode_restore count=%s source_slots=%s",
+            len(handles),
+            [slot.adapter_id for slot, *_ in restored_groups],
+        )
+        return True
+
     def _build_mixed_decode_routed_session_for_slot_locked(
         self,
         slot: _AdapterSlot,
@@ -1179,13 +1299,19 @@ class MOLAEngine:
                 )
             except RoutedDecodeContractError:
                 logger.exception("Mixed routed decode contract error")
+                if self._restore_mixed_decode_slot_to_source_generators(slot):
+                    return
                 self._fail_slot(slot, "internal error")
                 return
             except Exception:
                 logger.exception("Mixed routed decode backend unavailable; falling back")
+                if self._restore_mixed_decode_slot_to_source_generators(slot):
+                    return
                 self._fail_slot(slot, "internal error")
                 return
             if routed_session is None:
+                if self._restore_mixed_decode_slot_to_source_generators(slot):
+                    return
                 self._fail_slot(slot, "internal error")
                 return
             t0 = time.monotonic()
@@ -1197,6 +1323,8 @@ class MOLAEngine:
                         return
                     except Exception:
                         logger.exception("Mixed decode BatchGenerator error")
+                        if self._restore_mixed_decode_slot_to_source_generators(slot):
+                            return
                         self._fail_slot(slot, "internal error")
                         return
         step_ms = (time.monotonic() - t0) * 1000

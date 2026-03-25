@@ -1290,6 +1290,101 @@ class TestMixedDecodeMigration:
         assert snap["mixed_decode_rows"] == 1
         assert snap["avg_mixed_decode_rows"] == 1.0
 
+    def test_step_mixed_decode_slot_restores_requests_when_backend_unavailable(self):
+        engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        shared_generator = MagicMock()
+        shared_generator.active_handles.return_value = (GeneratorHandle(uid=70),)
+        shared_generator.take_states.return_value = [
+            GeneratorState(
+                handle=GeneratorHandle(uid=70),
+                next_token=101,
+                logprobs="lp",
+                max_tokens=10,
+                num_tokens=1,
+                cache=["cache"],
+                sampler=None,
+                logits_processors=[],
+                tokens=[1, 2, 3],
+            )
+        ]
+        shared_slot = _AdapterSlot(
+            generator=shared_generator,
+            adapter_id=MIXED_DECODE_ADAPTER_ID,
+            generator_key=MIXED_DECODE_ADAPTER_ID,
+            active_uids={70},
+        )
+        source_generator = MagicMock()
+        source_generator.restore_states.return_value = [GeneratorHandle(uid=7)]
+        source_slot = _AdapterSlot(
+            generator=source_generator,
+            adapter_id="rust",
+            active_uids=set(),
+        )
+        engine._generators["rust"] = source_slot
+        engine._uid_to_request[(MIXED_DECODE_ADAPTER_ID, 70)] = req
+        engine._build_mixed_decode_routed_session_for_slot_locked = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+        engine._fail_slot = MagicMock()
+
+        engine._step_mixed_decode_slot(shared_slot)
+
+        source_generator.restore_states.assert_called_once()
+        engine._fail_slot.assert_not_called()
+        assert shared_slot.active_uids == set()
+        assert source_slot.active_uids == {7}
+        assert req.uid == 7
+        assert (MIXED_DECODE_ADAPTER_ID, 70) not in engine._uid_to_request
+        assert ("rust", 7) in engine._uid_to_request
+
+    def test_step_mixed_decode_slot_restores_requests_when_routed_session_missing(self):
+        engine = _make_engine(config=EngineConfig(enable_routed_decode_reference=True))
+        req = GenerateRequest([1], "rust", 10, None, asyncio.Queue())
+        req.first_token_at = time.time()
+        shared_generator = MagicMock()
+        shared_generator.active_handles.return_value = (GeneratorHandle(uid=70),)
+        shared_generator.take_states.return_value = [
+            GeneratorState(
+                handle=GeneratorHandle(uid=70),
+                next_token=101,
+                logprobs="lp",
+                max_tokens=10,
+                num_tokens=1,
+                cache=["cache"],
+                sampler=None,
+                logits_processors=[],
+                tokens=[1, 2, 3],
+            )
+        ]
+        shared_slot = _AdapterSlot(
+            generator=shared_generator,
+            adapter_id=MIXED_DECODE_ADAPTER_ID,
+            generator_key=MIXED_DECODE_ADAPTER_ID,
+            active_uids={70},
+        )
+        source_generator = MagicMock()
+        source_generator.restore_states.return_value = [GeneratorHandle(uid=9)]
+        source_slot = _AdapterSlot(
+            generator=source_generator,
+            adapter_id="rust",
+            active_uids=set(),
+        )
+        engine._generators["rust"] = source_slot
+        engine._uid_to_request[(MIXED_DECODE_ADAPTER_ID, 70)] = req
+        engine._build_mixed_decode_routed_session_for_slot_locked = lambda _slot: None
+        engine._fail_slot = MagicMock()
+
+        engine._step_mixed_decode_slot(shared_slot)
+
+        source_generator.restore_states.assert_called_once()
+        engine._fail_slot.assert_not_called()
+        assert shared_slot.active_uids == set()
+        assert source_slot.active_uids == {9}
+        assert req.uid == 9
+        assert ("rust", 9) in engine._uid_to_request
+
 
 class TestScheduling:
     def test_orders_slots_by_oldest_unstarted_request(self):

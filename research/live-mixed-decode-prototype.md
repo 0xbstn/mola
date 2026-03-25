@@ -518,6 +518,14 @@ Implementation detail:
 - `k_proj` / `v_proj` / `down_proj`: `threads_x = 128`
 - `up_proj` / `gate_proj`: no Metal path
 
+Safety behavior:
+- if Metal kernel creation fails, the backend now degrades to `gather-mm` instead of failing the routed session factory
+- if a mixed shared decode batch cannot build or run its routed session, the migrated requests are restored back to their per-adapter generators instead of being failed in place
+
+[Inference]
+This matters more than it first seemed.
+Without those guards, a backend experiment can look acceptable in steady-state benchmarks while still being too fragile to keep around as a real runtime option.
+
 ### Live result at `128`, `repeats=2`
 
 Compared against `gather-mm` on the same runtime profile:
