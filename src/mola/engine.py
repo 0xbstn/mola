@@ -129,6 +129,10 @@ class EngineMetrics:
     routed_decode_reference_strict: bool = False
     routed_decode_backend: str = "reference"
     mixed_decode_migration_enabled: bool = False
+    mixed_decode_migration_events: int = 0
+    mixed_decode_migrated_sequences: int = 0
+    mixed_decode_steps: int = 0
+    mixed_decode_rows: int = 0
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -156,6 +160,13 @@ class EngineMetrics:
             "routed_decode_reference_strict": self.routed_decode_reference_strict,
             "routed_decode_backend": self.routed_decode_backend,
             "mixed_decode_migration_enabled": self.mixed_decode_migration_enabled,
+            "mixed_decode_migration_events": self.mixed_decode_migration_events,
+            "mixed_decode_migrated_sequences": self.mixed_decode_migrated_sequences,
+            "mixed_decode_steps": self.mixed_decode_steps,
+            "mixed_decode_rows": self.mixed_decode_rows,
+            "avg_mixed_decode_rows": round(
+                self.mixed_decode_rows / self.mixed_decode_steps, 2
+            ) if self.mixed_decode_steps else 0,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -1105,6 +1116,8 @@ class MOLAEngine:
                 slot.service_debt = 0.0
             shared_slot.last_active = now
             shared_slot.last_service_ts = now
+            self.metrics.mixed_decode_migration_events += 1
+            self.metrics.mixed_decode_migrated_sequences += len(restored_handles)
             self.metrics.active_generators = self._generator_count_locked()
             self._update_sequence_count_locked()
         logger.debug(
@@ -1194,6 +1207,8 @@ class MOLAEngine:
         with self._state_lock:
             slot.slot_metrics.record_step(step_ms, lock_wait_ms, len(responses))
             self.metrics.total_step_lock_wait_ms += lock_wait_ms
+            self.metrics.mixed_decode_steps += 1
+            self.metrics.mixed_decode_rows += len(responses)
             slot.service_debt = max(0.0, slot.service_debt - 1.0)
             slot.last_active = time.time()
             slot.last_service_ts = slot.last_active

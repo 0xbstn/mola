@@ -143,6 +143,61 @@ The gated runtime is the better shape:
 - roughly neutral to slightly better on the discriminating mixed cases at `conc=16`
 - no sign that the gating change breaks the scaling shape at `conc=32`
 
+## What the new live metrics say
+
+The gated prototype now exports:
+- migration event count
+- migrated sequence count
+- mixed decode step count
+- mixed decode row count
+- average rows per mixed decode step
+
+Representative `repeats=1` live run:
+
+- `same @8`
+  - `migration_events=0`
+  - `migrated_sequences=0`
+  - `mixed_steps=0`
+  - `avg_rows=0.0`
+
+- `mixed @8`
+  - `migration_events=8`
+  - `migrated_sequences=8`
+  - `mixed_steps=74`
+  - `mixed_rows=381`
+  - `avg_rows=5.15`
+
+- `long-decode-mixed @8`
+  - `migration_events=8`
+  - `migrated_sequences=8`
+  - `mixed_steps=132`
+  - `mixed_rows=699`
+  - `avg_rows=5.30`
+
+- `mixed @16`
+  - `migration_events=9`
+  - `migrated_sequences=16`
+  - `mixed_steps=76`
+  - `mixed_rows=776`
+  - `avg_rows=10.21`
+
+- `long-decode-mixed @16`
+  - `migration_events=9`
+  - `migrated_sequences=16`
+  - `mixed_steps=140`
+  - `mixed_rows=1357`
+  - `avg_rows=9.69`
+
+[Inference]
+This is a useful threshold result.
+The current runtime is no longer “barely exercising” the mixed shared path:
+- homogeneous traffic stays off it entirely
+- mixed traffic moves most adapted decode rows into it
+- the shared batch is already reasonably wide for decode
+
+[Inference]
+That makes the next likely ceiling more about the routed compute backend than about a low migration rate.
+
 ## What this means
 
 The current best experimental story is:

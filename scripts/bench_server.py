@@ -84,6 +84,11 @@ class ScenarioResult:
     engine_routed_decode_reference_strict: bool
     engine_routed_decode_backend: str
     engine_mixed_decode_migration_enabled: bool
+    engine_mixed_decode_migration_events: int
+    engine_mixed_decode_migrated_sequences: int
+    engine_mixed_decode_steps: int
+    engine_mixed_decode_rows: int
+    engine_avg_mixed_decode_rows: float
     models: list[str]
 
 
@@ -351,6 +356,40 @@ async def _run_scenario(
         ),
         engine_mixed_decode_migration_enabled=bool(
             after.get("mixed_decode_migration_enabled", False)
+        ),
+        engine_mixed_decode_migration_events=int(
+            after.get("mixed_decode_migration_events", 0)
+            - before.get("mixed_decode_migration_events", 0)
+        ),
+        engine_mixed_decode_migrated_sequences=int(
+            after.get("mixed_decode_migrated_sequences", 0)
+            - before.get("mixed_decode_migrated_sequences", 0)
+        ),
+        engine_mixed_decode_steps=int(
+            after.get("mixed_decode_steps", 0)
+            - before.get("mixed_decode_steps", 0)
+        ),
+        engine_mixed_decode_rows=int(
+            after.get("mixed_decode_rows", 0)
+            - before.get("mixed_decode_rows", 0)
+        ),
+        engine_avg_mixed_decode_rows=(
+            round(
+                (
+                    after.get("mixed_decode_rows", 0)
+                    - before.get("mixed_decode_rows", 0)
+                )
+                / (
+                    after.get("mixed_decode_steps", 0)
+                    - before.get("mixed_decode_steps", 0)
+                ),
+                2,
+            )
+            if (
+                after.get("mixed_decode_steps", 0)
+                - before.get("mixed_decode_steps", 0)
+            )
+            else 0.0
         ),
         models=models,
     )
