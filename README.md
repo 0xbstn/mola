@@ -28,7 +28,7 @@ Switch between adapters: instant.
 Same-adapter requests: batched.
 ```
 
-> **Status:** Alpha. Core serving works, same-adapter batching is healthy, and the API contract is stable enough for experimentation. Mixed-adapter decode is still the main performance ceiling. The opt-in homogeneous routed-decode reference path is now validated as a correctness scaffold, but it is currently slower than the default runtime and should stay experimental. Tested on mlx-lm 0.31.1.
+> **Status:** Alpha. The current architecture winner is now the detached shared decode owner runtime on top of the reproducible `mlx-lm` detached-batch patch, with `metal-gather` as the best routed compute backend. Same-adapter and mixed-adapter serving are both stable. The routed decode reference path remains a correctness scaffold, not the default fast path. Tested on `mlx-lm 0.31.1`.
 
 ## Why
 
@@ -50,6 +50,8 @@ MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory unt
 - **Token-budget admission control** -- `--max-inflight-tokens` limits total in-flight work using `prompt_tokens + max_tokens`
 - **Engine metrics** -- TTFT, tok/s, queue depth, active sequences, and lock-wait counters via `/v1/engine/metrics`
 - **Experimental routed decode reference** -- `--enable-routed-decode-reference` prepares a homogeneous decode-only routed LoRA path for pre-kernel validation; it is a correctness/reference path, not a faster runtime path today
+- **Detached shared decode owner** -- the current winner architecture centralizes mixed decode ownership behind `DecodeOwner` instead of leaving decode fully generator-owned
+- **Reproducible `mlx-lm` patch flow** -- winner runtime is reproducible via a tracked patcher and tracked launcher instead of manual edits
 - **Backpressure** -- returns 503 when overloaded instead of queuing unboundedly
 - **Client disconnect handling** -- cancelled requests are removed from the engine
 
@@ -60,25 +62,73 @@ MOLA brings multi-LoRA serving to MLX. The base model weights stay in memory unt
 ```bash
 git clone https://github.com/0xbstn/mola.git
 cd mola
-pip install -e ".[dev]"
+python3 -m venv .venv
+./.venv/bin/python -m ensurepip --upgrade
+./.venv/bin/python -m pip install -e ".[dev]"
+./.venv/bin/python devtools/apply_mlx_lm_detached_batch_api.py
+```
+
+### Winner Current Architecture
+
+The current architecture winner is:
+
+- detached shared decode owner
+- public detached-batch API patched into local `mlx-lm`
+- routed mixed decode backend `metal-gather`
+- mixed decode migration + pre-step migration
+- routed session caching
+
+This is the exact reproducible winner launcher:
+
+```bash
+cd mola
+./.venv/bin/python devtools/run_mola_winner.py start --port 8000
+```
+
+Equivalent explicit server command:
+
+```bash
+./.venv/bin/python -m mola.cli -v serve \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --adapter rust ./adapters/rust-lora \
+  --adapter sql ./adapters/sql-lora \
+  --adapter medical ./adapters/medical-lora \
+  --adapter cyber ./adapters/cyber-lora \
+  --adapter solidity ./adapters/solidity-lora \
+  --adapter devops ./adapters/devops-lora \
+  --adapter math ./adapters/math-lora \
+  --adapter legal ./adapters/legal-lora \
+  --max-inflight-tokens 131072 \
+  --max-batch-size 128 \
+  --prefill-batch-size 32 \
+  --enable-routed-decode-reference \
+  --strict-routed-decode-reference \
+  --routed-decode-backend metal-gather \
+  --enable-mixed-decode-migration \
+  --prestep-mixed-decode-migration \
+  --cache-routed-decode-sessions \
+  --detached-shared-decode-owner \
+  --port 8000
+```
+
+To stop or restart the winner:
+
+```bash
+./.venv/bin/python devtools/run_mola_winner.py stop --port 8000
+./.venv/bin/python devtools/run_mola_winner.py restart --port 8000
 ```
 
 ### Serve
 
 ```bash
-mola serve \
-  --model mlx-community/Qwen3.5-35B-A3B-4bit \
-  --adapter rust ./adapters/rust-lora \
-  --adapter sql ./adapters/sql-lora \
-  --max-inflight-tokens 32768 \
-  --enable-routed-decode-reference \
-  --strict-routed-decode-reference \
-  --port 8000
+./.venv/bin/python devtools/run_mola_winner.py start --port 8000
 ```
 
 `--max-inflight-tokens` sets a global admission budget based on `prompt_tokens + max_tokens` per request. It matters under heavy prefill load and should be tuned against available unified memory.
 
-`--enable-routed-decode-reference` turns on the current homogeneous routed-decode reference path. It is meant for controlled validation, not as the default production path yet. Live validation on March 24, 2026 showed it is slower than the default runtime on `same`, `mixed`, `fairness`, and `long-decode-mixed` workloads.
+`devtools/run_mola_winner.py` first applies the tracked `mlx-lm` detached-batch patch if needed, then starts the current winner configuration.
+
+`--enable-routed-decode-reference` still turns on the routed decode validation seam, but in the current winner architecture it is paired with the `metal-gather` backend and the detached decode owner runtime.
 
 `--strict-routed-decode-reference` is the fail-closed variant for backend validation. With it enabled, routed decode contract mismatches are surfaced instead of silently falling back to the default adapter path.
 
@@ -141,18 +191,20 @@ MOLAEngine.submit()         ─── backpressure (503 if full)
     │
     ▼
 ┌───────────────────────────────────────────┐
-│ Engine thread (round-robin)               │
+│ Engine thread + DecodeOwner               │
 │                                           │
-│  BatchGenerator "rust"  ◄── same-adapter  │
-│  BatchGenerator "sql"       batching      │
-│  BatchGenerator base                      │
+│  Adapter-local BatchGenerators            │
+│    └── prefill / ramp-up feeders          │
+│                                           │
+│  Shared detached DecodeOwner              │
+│    └── mixed decode owner                 │
 │                                           │
 │  model_lock ◄── prevents race with        │
 │                  adapter load/unload       │
 └───────────────────────────────────────────┘
     │
     ▼
-MultiLoRALinear             ─── reads adapter from contextvars
+MultiLoRALinear             ─── routed session + slot metadata
     │                           applies the right delta per layer
     ▼
 Tokens dispatched via async queue ──► SSE stream
@@ -218,15 +270,33 @@ Server health check with model and adapter count.
 
 ## Benchmarks
 
-Light benchmark snapshot measured on Qwen2.5-0.5B-Instruct-4bit with rust + sql adapters (Apple Silicon):
+Canonical current-architecture benchmark:
 
-| Scenario | conc=8 | conc=16 |
+```bash
+./.venv/bin/python scripts/bench_server.py \
+  --routed-validation \
+  --concurrency 64,128 \
+  --repeats 3 \
+  --json-out benchmark/current-architecture-winner-routed-validation-r3.json
+```
+
+Measured on `mlx-community/Qwen2.5-0.5B-Instruct-4bit` with 8 resident adapters on Apple Silicon:
+
+| Scenario | conc=64 | conc=128 |
 |---|---|---|
-| Base | 21.4 req/s, 1368 tok/s, p95 375 ms | 26.3 req/s, 1681 tok/s, p95 610 ms |
-| Same adapter | 13.6 req/s, 786 tok/s, p95 597 ms | 18.1 req/s, 1048 tok/s, p95 889 ms |
-| Mixed | 4.8 req/s, 246 tok/s, p95 1724 ms | 7.0 req/s, 346 tok/s, p95 2334 ms |
+| Same | 33.6 req/s, 1984.8 tok/s, p95 1927.3 ms | 31.9 req/s, 1937.4 tok/s, p95 3957.6 ms |
+| Mixed | 27.8 req/s, 1351.4 tok/s, p95 2284.9 ms | 26.7 req/s, 1311.5 tok/s, p95 4614.4 ms |
+| Long decode mixed | 12.2 req/s, 1752.8 tok/s, p95 5290.1 ms | 13.4 req/s, 1996.5 tok/s, p95 9425.9 ms |
+| Fairness | 29.7 req/s, 1533.4 tok/s, p95 2184.8 ms | 28.4 req/s, 1472.7 tok/s, p95 4346.7 ms |
 
-Same-adapter batching scales well. Mixed-adapter traffic is correct and usable, but mixed decode remains the main throughput and latency ceiling.
+Key ratios on the winner:
+
+- `mixed / same @64` ≈ `0.83`
+- `mixed / same @128` ≈ `0.84`
+
+Benchmark artifact committed in the repo:
+
+- [current-architecture-winner-routed-validation-r3.json](/Users/bastienbouge/Documents/dev/mola/benchmark/current-architecture-winner-routed-validation-r3.json)
 
 ## One-shot generation (no server)
 
@@ -272,10 +342,29 @@ Compare: loading 10 separate fine-tuned models would require ~180 GB.
 
 - **Alpha** -- API contract is stable but internals may change
 - **Apple Silicon only** -- requires MLX (no CUDA, no CPU fallback)
-- **No cross-adapter batching** -- requests with different adapters are round-robined, not batched in the same forward pass. Same-adapter requests ARE batched.
+- **Local `mlx-lm` patch required** -- the current winner depends on a reproducible local patch to `mlx_lm.generate.BatchGenerator`; this is scripted, but not upstreamed yet
+- **Mixed prefill is not solved** -- the current winner broadens mixed decode materially, but prefill/KV ownership is still not a first-class subsystem
+- **No paged KV / residency controller yet** -- adapter+KV ownership, paged base KV, and deeper prefill-owner work remain future architecture work
 - **KV cache** -- switching adapters mid-conversation invalidates the KV cache. Each conversation should use one adapter throughout.
 - **Strict adapter validation** -- an adapter must inject into all its expected target layers. Partially compatible adapters are rejected at load time.
-- **No custom kernels** -- uses standard MLX matmul. Cross-adapter batching (S-LoRA style) would require a custom Metal kernel (BGMV equivalent).
+- **Still not a CUDA-class multi-LoRA engine** -- this winner uses routed MLX ops and a detached decode owner; it is materially better than the older generator-owned runtime, but it is not yet a paged-KV heterogeneous scheduler like vLLM/S-LoRA-class systems.
+
+## What Is Merged vs Lab
+
+Merged in this current architecture candidate:
+
+- detached shared decode owner runtime
+- reproducible `mlx-lm` detached-batch patch flow
+- `metal-gather` as the current routed backend winner
+- reproducible launcher and canonical benchmark command
+
+Kept out of this merge candidate:
+
+- chunked prefill + decode interleaving lab line
+- Qwen3.5-9B baseline work
+- falsified `metal-gather` local refinements
+- falsified alternate routed backend families
+- deeper prefill-owner / paged-KV / residency experiments
 
 ## Contributing
 
