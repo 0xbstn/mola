@@ -232,6 +232,14 @@ Decision:
 - keep `gather-mm` unsorted as the meaningful non-kernel backend
 - if sorted routing is revisited later, it should be paired with a runtime that can actually feed much larger grouped batches
 
+One extra runtime check made this even clearer:
+- on a tiny real `gather_mm` routed LoRA example, `sorted_indices=True` produced the wrong result in `float16`
+- the same shape in `float32` failed because the expected Metal function was missing
+
+[Inference]
+So today this is not just a “not worth it yet” path.
+For MOLA’s routed LoRA delta shape on this stack, it is currently not a trustworthy backend candidate.
+
 ## Batch-size knob result
 
 The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
