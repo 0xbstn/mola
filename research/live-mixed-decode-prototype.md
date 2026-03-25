@@ -288,6 +288,72 @@ Decision:
 - keep the knob exposed
 - do not change the default from `32` yet
 
+## High-concurrency profile exploration
+
+Two follow-up sweeps mattered more than expected:
+
+### `max_batch_size=64`, `prefill_batch_size=32`
+
+At `conc=64`, compared to the `b64/p8` profile:
+
+- `same`
+  - `27.2 -> 29.9 req/s`
+  - `1588.8 -> 1761.6 tok/s`
+  - `2345.7 -> 2133.7 ms p95`
+
+- `mixed`
+  - `23.6 -> 22.7 req/s`
+  - `1084.7 -> 1117.1 tok/s`
+  - `2694.6 -> 2791.7 ms p95`
+
+- `long-decode-mixed`
+  - `15.2 -> 15.2 req/s`
+  - `1429.2 -> 1441.8 tok/s`
+  - `4204.8 -> 4188.0 ms p95`
+
+- `fairness`
+  - `23.8 -> 25.3 req/s`
+  - `1248.4 -> 1309.3 tok/s`
+  - `2671.1 -> 2485.1 ms p95`
+
+[Inference]
+At higher load, a larger prefill wave is not just a prompt-side knob.
+It helps the runtime fill the larger decode batches faster and can materially improve the `same` and `fairness` shapes.
+
+### `max_batch_size=128`, `prefill_batch_size=32`
+
+At `conc=128`, compared to `b64/p32`:
+
+- `same`
+  - `30.2 -> 32.0 req/s`
+  - `1826.9 -> 1909.4 tok/s`
+  - `4228.9 -> 3986.4 ms p95`
+
+- `mixed`
+  - `22.8 -> 23.3 req/s`
+  - `1125.6 -> 1158.1 tok/s`
+  - `5376.2 -> 5272.7 ms p95`
+
+- `long-decode-mixed`
+  - `15.4 -> 16.8 req/s`
+  - `1444.5 -> 1536.7 tok/s`
+  - `8067.7 -> 7483.7 ms p95`
+
+- `fairness`
+  - `24.1 -> 23.5 req/s`
+  - `1228.7 -> 1216.7 tok/s`
+  - `5051.6 -> 5270.4 ms p95`
+
+[Inference]
+There is now a credible high-concurrency profile that is better than the default experimental shape:
+- `max_batch_size=64` or `128`
+- `prefill_batch_size=32`
+
+But it is still a profile, not a new universal default:
+- it helps most under high load
+- it can trade away some `fairness` behavior depending on the setting
+- it should stay opt-in until more sweeps are collected
+
 ## What this means
 
 The current best experimental story is:
