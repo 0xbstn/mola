@@ -259,6 +259,102 @@ Decision:
 [Inference]
 For now, `gather-mm` remains the only routed non-kernel backend worth carrying in the live code path.
 
+## Experimental backend: `metal-gather`
+
+After the shared mixed decode path was stable enough to benchmark at higher concurrency, a second routed compute backend was added:
+- keep `gather-mm` for the routed `A` contraction
+- use a custom Metal kernel for the routed `B` expansion on selected layer families
+
+The first safe version only covered:
+- `q/k/v/o`
+- `down`
+
+That backend was already slightly better than plain `gather-mm` at high concurrency, especially on `long-decode-mixed`.
+
+Then the Metal path was generalized to large-output families too:
+- `up`
+- `gate`
+
+The generalized kernel changed from:
+- one reduction thread-row per rank lane
+- only `lane_y == 0` writing outputs
+
+to:
+- cooperative reduction into `zbuf`
+- all threads participating in the output write loop
+- fixed launch shape `64 x max(16, rank)`
+
+[Inference]
+That generalization matters because the remaining routed compute gap is mostly in the large-output MLP projections, not in the smaller attention projections.
+
+## `metal-gather`: live result after large-output generalization
+
+Bench file:
+- `/tmp/server-metal-gather-wide-b128-p32-r1.json`
+
+Compared against the earlier `metal-gather` and `gather-mm` runs:
+
+### `conc=128`
+
+- `same`
+  - new generalized `metal-gather`: `32.43 req/s`, `1930.8 tok/s`, `3933 ms p95`
+  - earlier `metal-gather`: `31.79 req/s`, `1892.8 tok/s`, `4072 ms p95`
+  - `gather-mm`: `32.24 req/s`, `1915.6 tok/s`, `3911 ms p95`
+
+- `mixed`
+  - new generalized `metal-gather`: `23.16 req/s`, `1151.2 tok/s`, `5321 ms p95`
+  - earlier `metal-gather`: `23.12 req/s`, `1163.4 tok/s`, `5378 ms p95`
+  - `gather-mm`: `23.19 req/s`, `1147.3 tok/s`, `5323 ms p95`
+
+- `long-decode-mixed`
+  - new generalized `metal-gather`: `16.68 req/s`, `1563.3 tok/s`, `7397 ms p95`
+  - earlier `metal-gather`: `16.03 req/s`, `1516.6 tok/s`, `7759 ms p95`
+  - `gather-mm`: `16.00 req/s`, `1487.4 tok/s`, `7721 ms p95`
+
+- `fairness`
+  - new generalized `metal-gather`: `24.48 req/s`, `1296.6 tok/s`, `5005 ms p95`
+  - earlier `metal-gather`: `24.57 req/s`, `1271.4 tok/s`, `5035 ms p95`
+  - `gather-mm`: `24.17 req/s`, `1241.9 tok/s`, `5109 ms p95`
+
+### `conc=256`
+
+- `same`
+  - new generalized `metal-gather`: `33.27 req/s`, `1989.1 tok/s`, `7576 ms p95`
+  - earlier `metal-gather`: `33.48 req/s`, `2013.1 tok/s`, `7619 ms p95`
+  - `gather-mm`: `32.76 req/s`, `1959.2 tok/s`, `7787 ms p95`
+
+- `mixed`
+  - new generalized `metal-gather`: `23.31 req/s`, `1151.7 tok/s`, `10655 ms p95`
+  - earlier `metal-gather`: `23.39 req/s`, `1153.4 tok/s`, `10644 ms p95`
+  - `gather-mm`: `23.22 req/s`, `1127.9 tok/s`, `10717 ms p95`
+
+- `long-decode-mixed`
+  - new generalized `metal-gather`: `15.60 req/s`, `1490.0 tok/s`, `15999 ms p95`
+  - earlier `metal-gather`: `15.46 req/s`, `1448.6 tok/s`, `16168 ms p95`
+  - `gather-mm`: `15.17 req/s`, `1441.9 tok/s`, `16384 ms p95`
+
+- `fairness`
+  - new generalized `metal-gather`: `23.96 req/s`, `1238.8 tok/s`, `10395 ms p95`
+  - earlier `metal-gather`: `23.67 req/s`, `1202.0 tok/s`, `10520 ms p95`
+  - `gather-mm`: `22.92 req/s`, `1193.7 tok/s`, `10833 ms p95`
+
+Decision:
+- keep the generalized `metal-gather` backend
+- do not make it the default global runtime backend
+- keep using it as the best experimental high-concurrency routed backend
+
+[Inference]
+This is the first routed compute backend in the repo that:
+- survives live shared mixed decode
+- stays correct under migration and restore checks
+- and gives a consistent end-to-end improvement over `gather-mm` on the discriminating mixed decode cases
+
+[Inference]
+The remaining opportunity is no longer “should there be a routed compute backend at all”.
+It is now mostly:
+- per-layer-family tuning
+- especially the large-output MLP path
+
 ## Batch-size knob result
 
 The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
@@ -586,3 +682,137 @@ Decision:
 - do not make it the default
 - keep `gather-mm` as the simpler experimental baseline
 - continue future compute work from this backend, not from the older naive `metal-kernel`
+
+## Large-output Metal generalization
+
+The first `metal-gather` revision only used the Metal path for:
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `o_proj`
+- `down_proj`
+
+It kept `gather-mm` for:
+- `up_proj`
+- `gate_proj`
+
+That was safe, but it also left a lot of routed decode work on the table because:
+- `up_proj` / `gate_proj` dominate some decoder layers
+- the old kernel shape only had one `lane_y == 0` stripe write outputs, which is a poor fit for large `out_dim`
+
+The next experiment changed the kernel shape:
+- keep the same `A` reduction into `zbuf`
+- but let all threads participate in the output projection
+- use:
+  - `THREADS_X = 64`
+  - `THREADS_Y = max(16, rank)`
+  - `lane = lane_y * THREADS_X + lane_x`
+  - `stride = THREADS_X * THREADS_Y`
+
+[Inference]
+This is still not a “full custom fused kernel”.
+It is a better output-parallel version of the same routed LoRA delta idea.
+
+### Live result with generalized large-output Metal path
+
+The generalized backend now covers:
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `o_proj`
+- `down_proj`
+- `up_proj`
+- `gate_proj`
+
+Compared against the previous tuned `metal-gather` backend:
+
+### `conc=128`, `repeats=1`
+
+- `same`
+  - `31.8 -> 32.4 req/s`
+  - `1892.8 -> 1930.8 tok/s`
+  - `4071.7 -> 3933.2 ms p95`
+- `mixed`
+  - `23.1 -> 23.2 req/s`
+  - `1163.4 -> 1151.2 tok/s`
+  - `5377.8 -> 5321.2 ms p95`
+- `long-decode-mixed`
+  - `16.0 -> 16.7 req/s`
+  - `1516.6 -> 1563.3 tok/s`
+  - `7759.2 -> 7396.9 ms p95`
+- `fairness`
+  - `24.6 -> 24.5 req/s`
+  - `1271.4 -> 1296.6 tok/s`
+  - `5035.3 -> 5005.3 ms p95`
+
+Compared against `gather-mm` at the same profile:
+
+- `same`
+  - `32.2 -> 32.4 req/s`
+  - `1915.6 -> 1930.8 tok/s`
+  - `3910.5 -> 3933.2 ms p95`
+- `mixed`
+  - `23.2 -> 23.2 req/s`
+  - `1147.3 -> 1151.2 tok/s`
+  - `5323.0 -> 5321.2 ms p95`
+- `long-decode-mixed`
+  - `16.0 -> 16.7 req/s`
+  - `1487.4 -> 1563.3 tok/s`
+  - `7720.7 -> 7396.9 ms p95`
+- `fairness`
+  - `24.2 -> 24.5 req/s`
+  - `1241.9 -> 1296.6 tok/s`
+  - `5108.6 -> 5005.3 ms p95`
+
+### `conc=256`, `repeats=1`
+
+Compared against the previous tuned `metal-gather` backend:
+
+- `same`
+  - `33.5 -> 33.3 req/s`
+  - `2013.1 -> 1989.1 tok/s`
+  - `7618.9 -> 7575.9 ms p95`
+- `mixed`
+  - `23.4 -> 23.3 req/s`
+  - `1153.4 -> 1151.7 tok/s`
+  - `10643.9 -> 10654.7 ms p95`
+- `long-decode-mixed`
+  - `15.5 -> 15.6 req/s`
+  - `1448.6 -> 1490.0 tok/s`
+  - `16167.8 -> 15999.2 ms p95`
+- `fairness`
+  - `23.7 -> 24.0 req/s`
+  - `1202.0 -> 1238.8 tok/s`
+  - `10520.3 -> 10394.5 ms p95`
+
+Compared against `gather-mm`:
+
+- `same`
+  - `32.8 -> 33.3 req/s`
+  - `1959.2 -> 1989.1 tok/s`
+  - `7787.0 -> 7575.9 ms p95`
+- `mixed`
+  - `23.2 -> 23.3 req/s`
+  - `1127.9 -> 1151.7 tok/s`
+  - `10717.3 -> 10654.7 ms p95`
+- `long-decode-mixed`
+  - `15.2 -> 15.6 req/s`
+  - `1441.9 -> 1490.0 tok/s`
+  - `16383.8 -> 15999.2 ms p95`
+- `fairness`
+  - `22.9 -> 24.0 req/s`
+  - `1193.7 -> 1238.8 tok/s`
+  - `10832.5 -> 10394.5 ms p95`
+
+[Inference]
+This is the first version of `metal-gather` that is:
+- clearly better on the discriminating `long-decode-mixed` case
+- roughly neutral to positive on `mixed`
+- still competitive on `same`
+- and more consistently ahead at higher concurrency
+
+Decision:
+- keep the generalized `metal-gather` backend
+- keep it experimental
+- use it as the current best high-load routed compute backend
+- do not change the global default yet

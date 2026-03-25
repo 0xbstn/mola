@@ -22,6 +22,8 @@ _METAL_LAYER_SUFFIXES = (
     ".v_proj",
     ".o_proj",
     ".down_proj",
+    ".up_proj",
+    ".gate_proj",
 )
 
 
@@ -63,16 +65,16 @@ if (lane_y < rank && lane_x == 0) {
 
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-if (lane_y == 0) {
-    T scale = T(scales[slot]);
-    for (uint out_col = lane_x; out_col < out_dim; out_col += THREADS_X) {
-        T acc = T(0);
-        for (uint r = 0; r < rank; ++r) {
-            uint b_idx = ((slot * rank + r) * out_dim) + out_col;
-            acc += zbuf[r] * T(b[b_idx]);
-        }
-        out[row * out_dim + out_col] = scale * acc;
+uint lane = lane_y * THREADS_X + lane_x;
+uint stride = THREADS_X * THREADS_Y;
+T scale = T(scales[slot]);
+for (uint out_col = lane; out_col < out_dim; out_col += stride) {
+    T acc = T(0);
+    for (uint r = 0; r < rank; ++r) {
+        uint b_idx = ((slot * rank + r) * out_dim) + out_col;
+        acc += zbuf[r] * T(b[b_idx]);
     }
+    out[row * out_dim + out_col] = scale * acc;
 }
 """
 
@@ -96,21 +98,17 @@ class MetalGatherRoutedLoRADeltaSession:
     ) -> bool:
         return (
             layer_name.endswith(_METAL_LAYER_SUFFIXES)
-            and
-            execution.abi.output_dim <= 1024
-            and execution.abi.rank * 128 <= 1024
+            and execution.abi.rank <= 16
+            and 64 * max(16, execution.abi.rank) <= 1024
         )
 
-    def _metal_threads_x(
+    def _metal_launch_shape(
         self,
         execution: FrozenRoutedLayerExecution,
-        layer_name: str,
-    ) -> int:
-        rank = int(execution.abi.rank)
-        limit = 1024 // max(rank, 1)
-        if layer_name.endswith((".q_proj", ".o_proj")):
-            return min(96, limit)
-        return min(128, limit)
+    ) -> tuple[int, int]:
+        threads_y = max(16, int(execution.abi.rank))
+        threads_x = 64
+        return threads_x, threads_y
 
     def _gather_delta(
         self,
@@ -146,7 +144,7 @@ class MetalGatherRoutedLoRADeltaSession:
         if self.kernel is None:
             raise RoutedDecodeContractError("metal-gather routed decode kernel is unavailable")
         rank = int(execution.abi.rank)
-        threads_x = self._metal_threads_x(execution, layer_name)
+        threads_x, threads_y = self._metal_launch_shape(execution)
         slot_row_by_id = execution.pack.slot_row_by_id
         slot_rows = mx.array(
             [slot_row_by_id[slot_id] for slot_id in execution.token_slot_ids],
@@ -164,10 +162,10 @@ class MetalGatherRoutedLoRADeltaSession:
                 ("T", self._kernel_template_dtype(flat_x.dtype)),
                 ("MAX_R", rank),
                 ("THREADS_X", threads_x),
-                ("THREADS_Y", rank),
+                ("THREADS_Y", threads_y),
             ],
-            grid=(threads_x, int(flat_x.shape[0]) * rank, 1),
-            threadgroup=(threads_x, rank, 1),
+            grid=(threads_x, int(flat_x.shape[0]) * threads_y, 1),
+            threadgroup=(threads_x, threads_y, 1),
             output_shapes=[(int(flat_x.shape[0]), execution.abi.output_dim)],
             output_dtypes=[flat_x.dtype],
         )[0]

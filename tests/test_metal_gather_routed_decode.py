@@ -61,6 +61,29 @@ def _gate_view():
     )
 
 
+def _other_view():
+    return LayerSlotPackView(
+        layer_name="layers.0.other_proj",
+        slot_ids=(1, 2),
+        entries=(
+            LayerSlotPackEntry(
+                adapter_name="rust",
+                slot_id=1,
+                lora_a=np.array([[1.0], [0.0]]),
+                lora_b=np.array([[2.0, 3.0]]),
+                scale=2.0,
+            ),
+            LayerSlotPackEntry(
+                adapter_name="sql",
+                slot_id=2,
+                lora_a=np.array([[0.0], [1.0]]),
+                lora_b=np.array([[4.0, 1.0]]),
+                scale=0.5,
+            ),
+        ),
+    )
+
+
 def _wide_view():
     return LayerSlotPackView(
         layer_name="layers.0.up_proj",
@@ -192,7 +215,7 @@ class TestMetalGatherRoutedDecodeBackend:
         assert len(kernel_calls) == 1
         assert kernel_calls[0]["output_shapes"] == [(16, 2)]
 
-    def test_mixed_large_output_falls_back_to_gather(self, monkeypatch):
+    def test_mixed_large_output_uses_metal_kernel(self, monkeypatch):
         module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
         factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
         session = factory.build((_wide_view(),), (2, 1, 2))
@@ -201,10 +224,11 @@ class TestMetalGatherRoutedDecodeBackend:
         delta = session.delta("layers.0.up_proj", x)
 
         assert np.allclose(delta, _expected(_wide_view(), (2, 1, 2), x))
-        assert gather_calls == [[1, 0, 1], [1, 0, 1]]
-        assert kernel_calls == []
+        assert gather_calls == []
+        assert len(kernel_calls) == 1
+        assert kernel_calls[0]["output_shapes"] == [(3, 1025)]
 
-    def test_gate_proj_stays_on_gather_even_when_small(self, monkeypatch):
+    def test_gate_proj_uses_metal_when_small(self, monkeypatch):
         module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
         factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
         token_slot_ids = tuple(([2, 1] * 8))
@@ -214,6 +238,19 @@ class TestMetalGatherRoutedDecodeBackend:
         delta = session.delta("layers.0.gate_proj", x)
 
         assert np.allclose(delta, _expected(_gate_view(), token_slot_ids, x))
+        assert gather_calls == []
+        assert len(kernel_calls) == 1
+
+    def test_unknown_layer_family_stays_on_gather(self, monkeypatch):
+        module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
+        factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
+        token_slot_ids = tuple(([2, 1] * 8))
+        session = factory.build((_other_view(),), token_slot_ids)
+        x = np.tile(np.array([[10.0, 1.0], [2.0, 5.0]], dtype=np.float32), (8, 1))
+
+        delta = session.delta("layers.0.other_proj", x)
+
+        assert np.allclose(delta, _expected(_other_view(), token_slot_ids, x))
         assert gather_calls == [[1, 0] * 8, [1, 0] * 8]
         assert kernel_calls == []
 
