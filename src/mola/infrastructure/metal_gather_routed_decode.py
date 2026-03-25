@@ -26,6 +26,10 @@ _METAL_LAYER_SUFFIXES = (
     ".gate_proj",
 )
 
+_QO_LAYER_SUFFIXES = (".q_proj", ".o_proj")
+_KV_LAYER_SUFFIXES = (".k_proj", ".v_proj")
+_UP_GATE_LAYER_SUFFIXES = (".up_proj", ".gate_proj")
+
 
 _METAL_GATHER_MIXED_SOURCE = """
 uint lane_x = thread_position_in_threadgroup.x;
@@ -105,10 +109,18 @@ class MetalGatherRoutedLoRADeltaSession:
     def _metal_launch_shape(
         self,
         execution: FrozenRoutedLayerExecution,
+        layer_name: str,
     ) -> tuple[int, int]:
-        threads_y = max(16, int(execution.abi.rank))
-        threads_x = 64
-        return threads_x, threads_y
+        rank = int(execution.abi.rank)
+        if layer_name.endswith(_QO_LAYER_SUFFIXES):
+            return 128, rank
+        if layer_name.endswith(_KV_LAYER_SUFFIXES):
+            return 64, max(16, rank)
+        if layer_name.endswith(".down_proj"):
+            return 64, rank
+        if layer_name.endswith(_UP_GATE_LAYER_SUFFIXES):
+            return 128, rank
+        return 64, max(16, rank)
 
     def _gather_delta(
         self,
@@ -144,7 +156,7 @@ class MetalGatherRoutedLoRADeltaSession:
         if self.kernel is None:
             raise RoutedDecodeContractError("metal-gather routed decode kernel is unavailable")
         rank = int(execution.abi.rank)
-        threads_x, threads_y = self._metal_launch_shape(execution)
+        threads_x, threads_y = self._metal_launch_shape(execution, layer_name)
         slot_row_by_id = execution.pack.slot_row_by_id
         slot_rows = mx.array(
             [slot_row_by_id[slot_id] for slot_id in execution.token_slot_ids],

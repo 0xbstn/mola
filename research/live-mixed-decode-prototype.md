@@ -355,6 +355,74 @@ It is now mostly:
 - per-layer-family tuning
 - especially the large-output MLP path
 
+## `metal-gather`: launch-shape tuning by layer family
+
+The next local iteration kept the same kernel structure but stopped using one launch shape for every layer family.
+
+Current experimental launch policy:
+- `q/o`: `128 x rank`
+- `k/v`: `64 x max(16, rank)`
+- `down`: `64 x rank`
+- `up/gate`: `128 x rank`
+
+Bench file:
+- `/tmp/server-metal-gather-wide2-b128-p32-r1.json`
+
+Compared against the previous generalized `metal-gather` run:
+
+### `conc=128`
+
+- `same`
+  - `32.43 -> 32.14 req/s`
+  - `1930.8 -> 1924.1 tok/s`
+  - `3933 -> 3967 ms p95`
+
+- `mixed`
+  - `23.16 -> 23.67 req/s`
+  - `1151.2 -> 1169.5 tok/s`
+  - `5321 -> 5204 ms p95`
+
+- `long-decode-mixed`
+  - `16.68 -> 17.54 req/s`
+  - `1563.3 -> 1598.7 tok/s`
+  - `7397 -> 7075 ms p95`
+
+- `fairness`
+  - `24.48 -> 24.96 req/s`
+  - `1296.6 -> 1275.5 tok/s`
+  - `5005 -> 4957 ms p95`
+
+### `conc=256`
+
+- `same`
+  - `33.27 -> 33.83 req/s`
+  - `1989.1 -> 2033.7 tok/s`
+  - `7576 -> 7441 ms p95`
+
+- `mixed`
+  - `23.31 -> 23.69 req/s`
+  - `1151.7 -> 1144.1 tok/s`
+  - `10655 -> 10491 ms p95`
+
+- `long-decode-mixed`
+  - `15.60 -> 15.64 req/s`
+  - `1490.0 -> 1463.6 tok/s`
+  - `15999 -> 15999 ms p95`
+
+- `fairness`
+  - `23.96 -> 24.56 req/s`
+  - `1238.8 -> 1241.6 tok/s`
+  - `10395 -> 10147 ms p95`
+
+Decision:
+- keep the layer-family launch-shape tuning
+- treat it as the best current `metal-gather` runtime profile
+- do not change the default global backend yet
+
+[Inference]
+This is still the same backend family, not a new algorithm.
+But it is now clearly better than the earlier generalized launch policy on the important live mixed workloads.
+
 ## Batch-size knob result
 
 The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
