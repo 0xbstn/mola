@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mola"
-version = "0.4.0"
+version = "0.1.0"
 description = "Multi-adapter Orchestration LoRA Apple — Multi-LoRA serving for MLX"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}

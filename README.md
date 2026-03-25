@@ -16,12 +16,14 @@
 
 MOLA serves multiple LoRA adapters from one MLX base model on Apple Silicon. The base model stays resident in memory, adapters are selected per request, and same-adapter traffic is batched automatically.
 
-> **Status:** Alpha. The published benchmark below uses `mlx-community/Qwen2.5-0.5B-Instruct-4bit` with 8 resident adapters on Apple Silicon and `mlx-lm 0.31.1`.
+> **Status:** Alpha. The published benchmark below uses `mlx-community/Qwen3.5-9B-MLX-4bit` with 8 resident adapters on `mlx-lm 0.31.1`.
 
 | Approach | Runtime shape |
 |---|---|
 | Separate fine-tuned models | one full model per specialty, higher memory, reloads when switching |
 | MOLA | one base model plus many LoRA adapters, lower memory, no model reloads |
+
+This is the practical tradeoff MOLA is built for: keep one base model resident, switch adapters per request, and avoid reloading full fine-tuned checkpoints.
 
 ## What MOLA Does
 
@@ -49,7 +51,7 @@ Start the recommended runtime profile:
 
 ```bash
 ./.venv/bin/python devtools/run_mola_current_architecture.py start \
-  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --model mlx-community/Qwen3.5-9B-MLX-4bit \
   --adapter rust ./path/to/rust-adapter \
   --adapter sql ./path/to/sql-adapter \
   --port 8000
@@ -59,7 +61,7 @@ Equivalent explicit command:
 
 ```bash
 ./.venv/bin/python -m mola.cli -v serve \
-  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --model mlx-community/Qwen3.5-9B-MLX-4bit \
   --adapter rust ./path/to/rust-adapter \
   --adapter sql ./path/to/sql-adapter \
   --adapter support ./path/to/support-adapter \
@@ -68,7 +70,7 @@ Equivalent explicit command:
   --prefill-batch-size 32 \
   --enable-routed-decode-reference \
   --strict-routed-decode-reference \
-  --routed-decode-backend metal-gather \
+  --routed-decode-backend gather-mm \
   --enable-mixed-decode-migration \
   --prestep-mixed-decode-migration \
   --cache-routed-decode-sessions \
@@ -126,28 +128,36 @@ Reproduce the published benchmark with:
 ```bash
 ./.venv/bin/python scripts/bench_server.py \
   --routed-validation \
-  --concurrency 1,64,128 \
+  --concurrency 1,16,64 \
   --repeats 3 \
-  --json-out /tmp/mola-current-architecture-bench.json
+  --json-out /tmp/mola-qwen35-9b-current-architecture-bench-1-16-64.json
 ```
 
 Published profile:
-- model: `mlx-community/Qwen2.5-0.5B-Instruct-4bit`
-- adapters: 8 resident adapters
-- backend: `metal-gather`
+- model: `mlx-community/Qwen3.5-9B-MLX-4bit`
+- adapters: `rust`, `sql`, `medical`, `cyber`, `solidity`, `devops`, `math`, `legal`
+- backend: `gather-mm`
 - batch sizes: `128 / 32`
+- machine: `Apple M5 Max 64GB`
 
-| Scenario | conc=1 | conc=64 | conc=128 |
-|---|---|---|---|
-| Same | 3.3 req/s, 201.6 tok/s, p95 317.0 ms | 33.3 req/s, 2020.5 tok/s, p95 1965.5 ms | 32.4 req/s, 1954.4 tok/s, p95 3898.3 ms |
-| Mixed | 3.2 req/s, 203.8 tok/s, p95 315.9 ms | 28.1 req/s, 1389.9 tok/s, p95 2260.7 ms | 27.5 req/s, 1354.3 tok/s, p95 4499.5 ms |
-| Long decode mixed | 1.3 req/s, 209.2 tok/s, p95 895.5 ms | 12.0 req/s, 1777.2 tok/s, p95 5271.4 ms | 13.7 req/s, 1931.1 tok/s, p95 9182.2 ms |
-| Hot/cold skew mix | 3.5 req/s, 203.2 tok/s, p95 313.4 ms | 30.0 req/s, 1525.7 tok/s, p95 2141.9 ms | 28.5 req/s, 1457.8 tok/s, p95 4326.9 ms |
+This benchmark shows how much performance MOLA keeps when traffic moves from one adapter at a time to a real mixed multi-adapter workload.
 
-Key ratios:
+| Concurrency | Same tok/s | Mixed tok/s | Multi-LoRA overhead | Mixed p95 |
+|---|---:|---:|---:|---:|
+| 1 | 76.4 | 76.4 | 0% | 843 ms |
+| 16 | 308.8 | 241.4 | -22% | 4220 ms |
+| 64 | 732.3 | 555.5 | -24% | 7372 ms |
 
-- `mixed / same @64` ≈ `0.83`
-- `mixed / same @128` ≈ `0.85`
+At concurrency 1, same and mixed are effectively the same shape; the useful signal starts once requests overlap.
+
+At moderate to high load, mixed multi-adapter traffic adds about 22-24% throughput overhead relative to same-adapter traffic.
+
+From the same run:
+
+- `long-decode-mixed` tok/s: `81.1` at `1`, `283.4` at `16`, `691.1` at `64`
+- `hot/cold skew mix` tok/s: `77.4` at `1`, `241.3` at `16`, `559.1` at `64`
+
+If you benchmark MOLA on another Apple Silicon machine or model, feel free to open an issue with your hardware, model, and results.
 
 ## Adapter Format
 
@@ -175,15 +185,6 @@ Train adapters with [mlx-lm](https://github.com/ml-explore/mlx-lm), [mlx-tune](h
 - A local `mlx-lm` patch is still required for the recommended setup
 - Switching adapters inside one conversation invalidates KV cache reuse
 - Mixed prefill and deeper KV/adaptor residency management are still open problems
-
-## Contributing
-
-```bash
-git clone https://github.com/0xbstn/mola.git
-cd mola
-./.venv/bin/python -m pip install -e ".[dev]"
-./.venv/bin/python -m pytest
-```
 
 ## License
 

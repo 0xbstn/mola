@@ -15,16 +15,16 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv" / "bin" / "python"
 PATCHER = ROOT / "devtools" / "apply_mlx_lm_detached_batch_api.py"
-DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-MLX-4bit"
 LOCAL_BENCHMARK_ADAPTERS = [
-    ("rust", ROOT / "adapters" / "rust-lora"),
-    ("sql", ROOT / "adapters" / "sql-lora"),
-    ("medical", ROOT / "adapters" / "medical-lora"),
-    ("cyber", ROOT / "adapters" / "cyber-lora"),
-    ("solidity", ROOT / "adapters" / "solidity-lora"),
-    ("devops", ROOT / "adapters" / "devops-lora"),
-    ("math", ROOT / "adapters" / "math-lora"),
-    ("legal", ROOT / "adapters" / "legal-lora"),
+    ("rust", ROOT / "adapters" / "qwen35-9b" / "rust-lora"),
+    ("sql", ROOT / "adapters" / "qwen35-9b" / "sql-lora"),
+    ("medical", ROOT / "adapters" / "qwen35-9b" / "medical-lora"),
+    ("cyber", ROOT / "adapters" / "qwen35-9b" / "cyber-lora"),
+    ("solidity", ROOT / "adapters" / "qwen35-9b" / "solidity-lora"),
+    ("devops", ROOT / "adapters" / "qwen35-9b" / "devops-lora"),
+    ("math", ROOT / "adapters" / "qwen35-9b" / "math-lora"),
+    ("legal", ROOT / "adapters" / "qwen35-9b" / "legal-lora"),
 ]
 
 
@@ -159,7 +159,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], Path]:
         "--enable-routed-decode-reference",
         "--strict-routed-decode-reference",
         "--routed-decode-backend",
-        "metal-gather",
+        "gather-mm",
         "--enable-mixed-decode-migration",
         "--prestep-mixed-decode-migration",
         "--cache-routed-decode-sessions",

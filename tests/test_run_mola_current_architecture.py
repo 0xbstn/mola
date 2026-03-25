@@ -20,6 +20,7 @@ SPEC.loader.exec_module(MODULE)
 
 def test_parse_args_defaults_to_current_architecture_profile() -> None:
     args = MODULE.parse_args(["start"])
+    assert args.model == "mlx-community/Qwen3.5-9B-MLX-4bit"
     assert args.max_inflight_tokens == 131072
     assert args.max_batch_size == 128
     assert args.prefill_batch_size == 32
@@ -46,6 +47,8 @@ def test_build_command_contains_current_architecture_flags() -> None:
     assert "--enable-routed-decode-reference" in cmd
     assert "--strict-routed-decode-reference" in cmd
     assert "--routed-decode-backend" in cmd
+    backend_index = cmd.index("--routed-decode-backend")
+    assert cmd[backend_index + 1] == "gather-mm"
     assert "--enable-mixed-decode-migration" in cmd
     assert "--prestep-mixed-decode-migration" in cmd
     assert "--cache-routed-decode-sessions" in cmd
