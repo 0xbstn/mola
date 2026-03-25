@@ -423,6 +423,44 @@ Decision:
 This is still the same backend family, not a new algorithm.
 But it is now clearly better than the earlier generalized launch policy on the important live mixed workloads.
 
+## Rejected backend candidate: `metal-bexpand`
+
+Another compute-only backend was tried after `metal-gather`:
+- keep `gather-mm` for the routed `A` contraction
+- transpose `B` once at session build time
+- run a custom Metal kernel only for the `B` expansion
+
+This backend was attractive because it reduced the amount of custom logic:
+- one `gather-mm` for `A`
+- one Metal kernel for `z @ B`
+- no need to custom-code the `A` reduction inside Metal
+
+Live result at `conc=128`:
+- `same`: `31.7 req/s`, `1891.7 tok/s`, `4023 ms p95`
+- `mixed`: `19.6 req/s`, `1280.8 tok/s`, `6173 ms p95`
+- `long-decode-mixed`: `12.1 req/s`, `1585.9 tok/s`, `9955 ms p95`
+- `fairness`: `20.8 req/s`, `1363.5 tok/s`, `6021 ms p95`
+
+Compared with the tuned `metal-gather` baseline at the same profile:
+- much worse on `mixed`
+- much worse on `long-decode-mixed`
+- much worse on `fairness`
+- only roughly comparable on `same`
+
+Decision:
+- drop `metal-bexpand` from the repo
+- keep only the conclusion
+
+[Inference]
+Splitting the routed delta into:
+- `gather-mm` for `A`
+- custom Metal only for `B`
+
+still leaves too much of the routed overhead in place.
+For this runtime, the better direction remains:
+- bucket rows by slot
+- keep the fused routed delta in one backend
+
 ## Batch-size knob result
 
 The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
