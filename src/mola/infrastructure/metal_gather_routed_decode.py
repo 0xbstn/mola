@@ -147,49 +147,21 @@ class MetalGatherRoutedLoRADeltaSession:
         ).squeeze(-2)
         return gathered_scales * y
 
-    def _prepare_bucketed_rows(
-        self,
-        flat_x: mx.array,
-        execution: FrozenRoutedLayerExecution,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
-        if execution.plan.homogeneous_slot_id is not None:
-            raise RoutedDecodeContractError("homogeneous routed execution should bypass bucketed mixed path")
-
-        if len(execution.plan.groups) <= 1:
-            slot_row_by_id = execution.pack.slot_row_by_id
-            slot_rows = mx.array(
-                [slot_row_by_id[slot_id] for slot_id in execution.token_slot_ids],
-                dtype=mx.int32,
-            )
-            return flat_x, slot_rows, None
-
-        grouped_x = [
-            flat_x[mx.array(group.token_rows, dtype=mx.int32)]
-            for group in execution.plan.groups
-        ]
-        bucketed_x = mx.concatenate(grouped_x, axis=0)
-        slot_rows = mx.array(
-            [
-                group.pack_row
-                for group in execution.plan.groups
-                for _ in group.token_rows
-            ],
-            dtype=mx.int32,
-        )
-        restore_order = mx.array(execution.plan.restore_order, dtype=mx.int32)
-        return bucketed_x, slot_rows, restore_order
-
     def _metal_delta(
         self,
         flat_x: mx.array,
         execution: FrozenRoutedLayerExecution,
         layer_name: str,
-        slot_rows: mx.array,
     ) -> mx.array:
         if self.kernel is None:
             raise RoutedDecodeContractError("metal-gather routed decode kernel is unavailable")
         rank = int(execution.abi.rank)
         threads_x, threads_y = self._metal_launch_shape(execution, layer_name)
+        slot_row_by_id = execution.pack.slot_row_by_id
+        slot_rows = mx.array(
+            [slot_row_by_id[slot_id] for slot_id in execution.token_slot_ids],
+            dtype=mx.int32,
+        )
         return self.kernel(
             inputs=[
                 flat_x,
@@ -248,10 +220,7 @@ class MetalGatherRoutedLoRADeltaSession:
 
             if self._should_use_metal(layer_name, execution) and self.kernel is not None:
                 try:
-                    metal_x, slot_rows, restore_order = self._prepare_bucketed_rows(flat_x, execution)
-                    delta = self._metal_delta(metal_x, execution, layer_name, slot_rows)
-                    if restore_order is not None:
-                        delta = delta[restore_order]
+                    delta = self._metal_delta(flat_x, execution, layer_name)
                 except Exception:
                     logger.exception(
                         "metal-gather kernel unavailable for layer '%s'; falling back to gather-mm",
