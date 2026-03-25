@@ -107,6 +107,29 @@ def _wide_view():
     )
 
 
+def _down_view():
+    return LayerSlotPackView(
+        layer_name="layers.0.down_proj",
+        slot_ids=(1, 2),
+        entries=(
+            LayerSlotPackEntry(
+                adapter_name="rust",
+                slot_id=1,
+                lora_a=np.array([[1.0], [0.0]]),
+                lora_b=np.array([[2.0, 3.0]]),
+                scale=2.0,
+            ),
+            LayerSlotPackEntry(
+                adapter_name="sql",
+                slot_id=2,
+                lora_a=np.array([[0.0], [1.0]]),
+                lora_b=np.array([[4.0, 1.0]]),
+                scale=0.5,
+            ),
+        ),
+    )
+
+
 def _expected(view, token_slot_ids, x):
     pack = materialize_layer_slot_packs(
         (view,),
@@ -145,6 +168,7 @@ def _load_backend_module(monkeypatch, *, kernel_raises: bool = False):
                 "threadgroup": threadgroup,
                 "template": template,
                 "output_shapes": output_shapes,
+                "slot_rows": np.asarray(inputs[-1], dtype=np.int32).tolist(),
             }
         )
         x, a, b, scales, slot_rows = inputs
@@ -214,6 +238,7 @@ class TestMetalGatherRoutedDecodeBackend:
         assert gather_calls == []
         assert len(kernel_calls) == 1
         assert kernel_calls[0]["output_shapes"] == [(16, 2)]
+        assert kernel_calls[0]["slot_rows"] == ([0] * 8) + ([1] * 8)
 
     def test_mixed_large_output_uses_metal_kernel(self, monkeypatch):
         module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
@@ -253,6 +278,56 @@ class TestMetalGatherRoutedDecodeBackend:
         assert np.allclose(delta, _expected(_other_view(), token_slot_ids, x))
         assert gather_calls == [[1, 0] * 8, [1, 0] * 8]
         assert kernel_calls == []
+
+    def test_launch_shape_varies_by_layer_family(self, monkeypatch):
+        module, _, _ = _load_backend_module(monkeypatch)
+        factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
+
+        q_session = factory.build((_view(),), (1, 2))
+        kv_session = factory.build(
+            (
+                LayerSlotPackView(
+                    layer_name="layers.0.k_proj",
+                    slot_ids=(1, 2),
+                    entries=_view().entries,
+                ),
+            ),
+            (1, 2),
+        )
+        down_session = factory.build((_down_view(),), (1, 2))
+        up_session = factory.build((_wide_view(),), (1, 2))
+
+        q_exec = q_session.layer_executions["layers.0.q_proj"]
+        kv_exec = kv_session.layer_executions["layers.0.k_proj"]
+        down_exec = down_session.layer_executions["layers.0.down_proj"]
+        up_exec = up_session.layer_executions["layers.0.up_proj"]
+
+        assert q_session._metal_launch_shape(q_exec, "layers.0.q_proj") == (128, 1)
+        assert kv_session._metal_launch_shape(kv_exec, "layers.0.k_proj") == (64, 16)
+        assert down_session._metal_launch_shape(down_exec, "layers.0.down_proj") == (64, 1)
+        assert up_session._metal_launch_shape(up_exec, "layers.0.up_proj") == (128, 1)
+
+    def test_bucketed_inputs_sort_rows_and_restore_order(self, monkeypatch):
+        module, gather_calls, kernel_calls = _load_backend_module(monkeypatch)
+        factory = module.MetalGatherRoutedLoRADeltaSessionFactory(strict=True)
+        token_slot_ids = (2, 1, 2, 1)
+        session = factory.build((_view(),), token_slot_ids)
+        x = np.array(
+            [
+                [10.0, 0.0],
+                [20.0, 0.0],
+                [30.0, 0.0],
+                [40.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        delta = session.delta("layers.0.q_proj", x)
+
+        assert np.allclose(delta, _expected(_view(), token_slot_ids, x))
+        assert gather_calls == []
+        assert len(kernel_calls) == 1
+        assert kernel_calls[0]["slot_rows"] == [0, 0, 1, 1]
 
     def test_kernel_creation_failure_falls_back_to_gather(self, monkeypatch):
         module, gather_calls, kernel_calls = _load_backend_module(
