@@ -25,12 +25,15 @@ MOLA serves multiple LoRA adapters from one MLX base model on Apple Silicon. The
 
 This is the practical tradeoff MOLA is built for: keep one base model resident, switch adapters per request, and avoid reloading full fine-tuned checkpoints.
 
-## What MOLA Does
+## Features
 
-- Serve one base model with many LoRA adapters loaded at the same time
-- Select the adapter per request through an OpenAI-compatible chat API
-- Batch same-adapter traffic and keep mixed-adapter serving stable
-- Hot-load and hot-unload adapters without restarting the server
+- OpenAI-compatible chat completions API
+- Per-request adapter selection via the `model` field
+- Multiple LoRA adapters loaded at once on one base model
+- Same-adapter batching and stable mixed-adapter serving
+- Hot-load and hot-unload adapters at runtime
+- Streaming responses
+- Runtime metrics via `/v1/engine/metrics`
 
 ## Quickstart
 
