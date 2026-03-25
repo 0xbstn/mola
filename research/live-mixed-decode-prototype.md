@@ -922,3 +922,85 @@ Decision:
 - keep it experimental
 - use it as the current best high-load routed compute backend
 - do not change the global default yet
+
+## Compile-time rank specialization
+
+The next useful experiment stayed inside the same `metal-gather` backend.
+No runtime changes, no new backend, no new routing policy.
+
+Only the shader changed:
+- remove the runtime `rank` variable from the mixed kernel
+- specialize directly on `MAX_R`
+- use `MAX_R` in the packed `A` / `B` indexing
+- explicitly ask the compiler to unroll the final `r` loop
+
+[Inference]
+This is the first compute tweak after the large-output generalization that meaningfully improved the live routed path without changing the runtime shape again.
+
+### Why this was worth trying
+
+For MOLA today:
+- LoRA rank is effectively fixed at a small value in the live experiments
+- the mixed routed kernel already compiles with `MAX_R` in the template
+- but the shader still paid a runtime-style `rank` loop in the hot path
+
+[Inference]
+That made compile-time specialization a low-risk kernel experiment:
+- same ABI
+- same backend
+- same mixed decode migration path
+- only less dynamic work inside the shader
+
+### Live result at `conc=128`, `repeats=2`
+
+Compared against the previous generalized `metal-gather` run:
+
+- `same`
+  - `31.8 -> 30.9 req/s`
+  - `1892.8 -> 1856.4 tok/s`
+  - `4071.7 -> 4056.4 ms p95`
+- `mixed`
+  - `23.1 -> 23.9 req/s`
+  - `1163.4 -> 1177.2 tok/s`
+  - `5377.8 -> 5177.3 ms p95`
+- `long-decode-mixed`
+  - `16.0 -> 16.3 req/s`
+  - `1516.6 -> 1547.4 tok/s`
+  - `7759.2 -> 7600.4 ms p95`
+- `fairness`
+  - `24.6 -> 25.0 req/s`
+  - `1271.4 -> 1275.3 tok/s`
+  - `5035.3 -> 4932.5 ms p95`
+
+### Live result at `conc=256`, `repeats=1`
+
+Compared against the previous generalized `metal-gather` run:
+
+- `same`
+  - `33.3 -> 33.2 req/s`
+  - `1989.1 -> 1920.9 tok/s`
+  - `7575.9 -> 7639.4 ms p95`
+- `mixed`
+  - `23.3 -> 23.8 req/s`
+  - `1151.7 -> 1170.9 tok/s`
+  - `10654.7 -> 10449.5 ms p95`
+- `long-decode-mixed`
+  - `15.6 -> 16.3 req/s`
+  - `1490.0 -> 1534.6 tok/s`
+  - `15999.2 -> 15338.7 ms p95`
+- `fairness`
+  - `24.0 -> 24.3 req/s`
+  - `1238.8 -> 1243.4 tok/s`
+  - `10394.5 -> 10241.7 ms p95`
+
+[Inference]
+This is not a universal win on every metric.
+But it is the first post-`metal-gather` shader tweak that looks worth keeping:
+- `same` is slightly softer
+- `mixed`, `long-decode-mixed`, and `fairness` improve
+- the improvement holds most clearly in the discriminating mixed decode cases
+
+Decision:
+- keep the compile-time rank specialization inside `metal-gather`
+- treat it as the current best routed compute backend variant
+- continue future kernel work from here, not from the rejected split `A/B` paths

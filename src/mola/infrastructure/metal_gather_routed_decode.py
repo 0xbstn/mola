@@ -37,7 +37,6 @@ uint lane_y = thread_position_in_threadgroup.y;
 uint row = threadgroup_position_in_grid.y;
 uint rows = x_shape[0];
 uint in_dim = x_shape[1];
-uint rank = a_shape[2];
 uint out_dim = b_shape[2];
 
 if (row >= rows) {
@@ -48,10 +47,10 @@ uint slot = uint(slot_rows[row]);
 threadgroup T partial[THREADS_Y][THREADS_X];
 threadgroup T zbuf[MAX_R];
 
-if (lane_y < rank) {
+if (lane_y < MAX_R) {
     T sum = T(0);
     for (uint d = lane_x; d < in_dim; d += THREADS_X) {
-        uint a_idx = ((slot * in_dim + d) * rank) + lane_y;
+        uint a_idx = ((slot * in_dim + d) * MAX_R) + lane_y;
         sum += T(x[row * in_dim + d]) * T(a[a_idx]);
     }
     partial[lane_y][lane_x] = sum;
@@ -59,7 +58,7 @@ if (lane_y < rank) {
 
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-if (lane_y < rank && lane_x == 0) {
+if (lane_y < MAX_R && lane_x == 0) {
     T z = T(0);
     for (uint lx = 0; lx < THREADS_X; ++lx) {
         z += partial[lane_y][lx];
@@ -74,8 +73,9 @@ uint stride = THREADS_X * THREADS_Y;
 T scale = T(scales[slot]);
 for (uint out_col = lane; out_col < out_dim; out_col += stride) {
     T acc = T(0);
-    for (uint r = 0; r < rank; ++r) {
-        uint b_idx = ((slot * rank + r) * out_dim) + out_col;
+    #pragma unroll
+    for (uint r = 0; r < MAX_R; ++r) {
+        uint b_idx = ((slot * MAX_R + r) * out_dim) + out_col;
         acc += zbuf[r] * T(b[b_idx]);
     }
     out[row * out_dim + out_col] = scale * acc;
