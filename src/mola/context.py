@@ -18,6 +18,9 @@ _current_slot_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 _current_routed_decode_session: contextvars.ContextVar[RoutedLoRADeltaSession | None] = contextvars.ContextVar(
     "mola_routed_decode_session", default=None
 )
+_current_neutralize_lora_delta: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mola_neutralize_lora_delta", default=False
+)
 
 
 @contextmanager
@@ -40,6 +43,15 @@ def routed_decode_context(session: RoutedLoRADeltaSession | None):
         _current_routed_decode_session.reset(session_token)
 
 
+@contextmanager
+def lora_delta_context(*, neutralize: bool):
+    token = _current_neutralize_lora_delta.set(neutralize)
+    try:
+        yield
+    finally:
+        _current_neutralize_lora_delta.reset(token)
+
+
 def get_current_adapter() -> str | None:
     return _current_adapter.get()
 
@@ -50,3 +62,7 @@ def get_current_slot_id() -> int | None:
 
 def get_current_routed_decode_session() -> RoutedLoRADeltaSession | None:
     return _current_routed_decode_session.get()
+
+
+def get_current_neutralize_lora_delta() -> bool:
+    return _current_neutralize_lora_delta.get()

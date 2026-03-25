@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 import logging
 import queue
 import threading
@@ -12,12 +12,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from mola.adapter import AdapterSlotBinding
+from mola.application.decode_owner import DecodeOwner, SharedMixedSlotDecodeOwner
 from mola.application.packing import LayerSlotPackView, MaterializedLayerSlotPack, RoutedLayerPackState, build_layer_slot_pack_state, build_layer_slot_pack_views, materialize_layer_slot_packs
 from mola.application.admission import AdmissionRejected, TokenBudgetAdmissionPolicy
-from mola.application.routed_decode import RoutedDecodeContractError
 from mola.application.scheduling import SlotSchedulingState, WaitingAwareSchedulingPolicy
-from mola.context import adapter_context, routed_decode_context
-from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorState, GeneratorSubmission
+from mola.context import adapter_context, lora_delta_context
+from mola.diagnostics import snapshot_delta_runtime_metrics
+from mola.ports.generator import GeneratorHandle, GeneratorPort, GeneratorSubmission
 from mola.ports.routed_decode import RoutedLoRADeltaSession, RoutedLoRADeltaSessionFactory
 
 if TYPE_CHECKING:
@@ -58,6 +59,10 @@ class EngineConfig:
     strict_routed_decode_reference: bool = False
     routed_decode_backend: str = "reference"
     enable_mixed_decode_migration: bool = False
+    prestep_mixed_decode_migration: bool = False
+    detached_shared_decode_owner: bool = False
+    cache_routed_decode_sessions: bool = False
+    neutralize_lora_delta: bool = False
 
 
 @dataclass
@@ -131,10 +136,32 @@ class EngineMetrics:
     routed_decode_reference_strict: bool = False
     routed_decode_backend: str = "reference"
     mixed_decode_migration_enabled: bool = False
+    prestep_mixed_decode_migration: bool = False
+    detached_shared_decode_owner: bool = False
+    cache_routed_decode_sessions: bool = False
+    neutralize_lora_delta: bool = False
     mixed_decode_migration_events: int = 0
     mixed_decode_migrated_sequences: int = 0
     mixed_decode_steps: int = 0
     mixed_decode_rows: int = 0
+    homogeneous_decode_steps: int = 0
+    homogeneous_decode_rows: int = 0
+    decode_step_samples: int = 0
+    decode_active_generators_total: int = 0
+    prefill_insert_batches: int = 0
+    prefill_insert_requests: int = 0
+    prefill_insert_batches_while_decode: int = 0
+    prefill_insert_requests_while_decode: int = 0
+    prefill_insert_single_batches: int = 0
+    homogeneous_routed_decode_session_builds: int = 0
+    homogeneous_routed_decode_session_cache_hits: int = 0
+    homogeneous_routed_decode_session_build_ms_total: float = 0.0
+    mixed_routed_decode_session_builds: int = 0
+    mixed_routed_decode_session_cache_hits: int = 0
+    mixed_routed_decode_session_build_ms_total: float = 0.0
+    mixed_decode_migration_since_insert_ms_total: float = 0.0
+    mixed_decode_migration_since_first_token_ms_total: float = 0.0
+    mixed_decode_migration_tokens_before_shared: int = 0
     _ttft_samples: list[float] = field(default_factory=list)
     _tps_samples: list[float] = field(default_factory=list)
 
@@ -147,7 +174,7 @@ class EngineMetrics:
             self._tps_samples = self._tps_samples[-100:]
 
     def snapshot(self) -> dict:
-        return {
+        snap = {
             "queued_requests": self.queued_requests,
             "active_generators": self.active_generators,
             "active_sequences": self.active_sequences,
@@ -164,13 +191,74 @@ class EngineMetrics:
             "routed_decode_reference_strict": self.routed_decode_reference_strict,
             "routed_decode_backend": self.routed_decode_backend,
             "mixed_decode_migration_enabled": self.mixed_decode_migration_enabled,
+            "prestep_mixed_decode_migration": self.prestep_mixed_decode_migration,
+            "detached_shared_decode_owner": self.detached_shared_decode_owner,
+            "cache_routed_decode_sessions": self.cache_routed_decode_sessions,
+            "neutralize_lora_delta": self.neutralize_lora_delta,
             "mixed_decode_migration_events": self.mixed_decode_migration_events,
             "mixed_decode_migrated_sequences": self.mixed_decode_migrated_sequences,
             "mixed_decode_steps": self.mixed_decode_steps,
             "mixed_decode_rows": self.mixed_decode_rows,
+            "homogeneous_decode_steps": self.homogeneous_decode_steps,
+            "homogeneous_decode_rows": self.homogeneous_decode_rows,
+            "decode_step_samples": self.decode_step_samples,
+            "decode_active_generators_total": self.decode_active_generators_total,
+            "prefill_insert_batches": self.prefill_insert_batches,
+            "prefill_insert_requests": self.prefill_insert_requests,
+            "prefill_insert_batches_while_decode": self.prefill_insert_batches_while_decode,
+            "prefill_insert_requests_while_decode": self.prefill_insert_requests_while_decode,
+            "prefill_insert_single_batches": self.prefill_insert_single_batches,
+            "homogeneous_routed_decode_session_builds": self.homogeneous_routed_decode_session_builds,
+            "homogeneous_routed_decode_session_cache_hits": self.homogeneous_routed_decode_session_cache_hits,
+            "mixed_routed_decode_session_builds": self.mixed_routed_decode_session_builds,
+            "mixed_routed_decode_session_cache_hits": self.mixed_routed_decode_session_cache_hits,
+            "mixed_decode_migration_since_insert_ms_total": round(
+                self.mixed_decode_migration_since_insert_ms_total, 2
+            ),
+            "mixed_decode_migration_since_first_token_ms_total": round(
+                self.mixed_decode_migration_since_first_token_ms_total, 2
+            ),
+            "mixed_decode_migration_tokens_before_shared": self.mixed_decode_migration_tokens_before_shared,
             "avg_mixed_decode_rows": round(
                 self.mixed_decode_rows / self.mixed_decode_steps, 2
             ) if self.mixed_decode_steps else 0,
+            "avg_homogeneous_decode_rows": round(
+                self.homogeneous_decode_rows / self.homogeneous_decode_steps, 2
+            ) if self.homogeneous_decode_steps else 0,
+            "avg_decode_generators_active": round(
+                self.decode_active_generators_total / self.decode_step_samples, 2
+            ) if self.decode_step_samples else 0,
+            "avg_prefill_insert_batch": round(
+                self.prefill_insert_requests / self.prefill_insert_batches, 2
+            ) if self.prefill_insert_batches else 0,
+            "avg_prefill_insert_batch_while_decode": round(
+                self.prefill_insert_requests_while_decode
+                / self.prefill_insert_batches_while_decode,
+                2,
+            ) if self.prefill_insert_batches_while_decode else 0,
+            "prefill_insert_single_batch_ratio": round(
+                self.prefill_insert_single_batches / self.prefill_insert_batches,
+                3,
+            ) if self.prefill_insert_batches else 0,
+            "avg_homogeneous_routed_decode_session_build_ms": round(
+                self.homogeneous_routed_decode_session_build_ms_total
+                / self.homogeneous_routed_decode_session_builds,
+                3,
+            ) if self.homogeneous_routed_decode_session_builds else 0,
+            "avg_mixed_routed_decode_session_build_ms": round(
+                self.mixed_routed_decode_session_build_ms_total
+                / self.mixed_routed_decode_session_builds,
+                3,
+            ) if self.mixed_routed_decode_session_builds else 0,
+            "avg_mixed_decode_migration_since_insert_ms": round(
+                self.mixed_decode_migration_since_insert_ms_total / self.mixed_decode_migrated_sequences, 2
+            ) if self.mixed_decode_migrated_sequences else 0,
+            "avg_mixed_decode_migration_since_first_token_ms": round(
+                self.mixed_decode_migration_since_first_token_ms_total / self.mixed_decode_migrated_sequences, 2
+            ) if self.mixed_decode_migrated_sequences else 0,
+            "avg_mixed_decode_tokens_before_shared": round(
+                self.mixed_decode_migration_tokens_before_shared / self.mixed_decode_migrated_sequences, 2
+            ) if self.mixed_decode_migrated_sequences else 0,
             "avg_ttft_ms": round(
                 sum(self._ttft_samples) / len(self._ttft_samples) * 1000, 1
             ) if self._ttft_samples else 0,
@@ -178,6 +266,8 @@ class EngineMetrics:
                 sum(self._tps_samples) / len(self._tps_samples), 1
             ) if self._tps_samples else 0,
         }
+        snap.update(snapshot_delta_runtime_metrics())
+        return snap
 
 
 @dataclass
@@ -223,9 +313,13 @@ class _AdapterSlot:
     last_active: float = field(default_factory=time.time)
     last_service_ts: float = 0.0
     slot_metrics: SlotMetrics = field(default_factory=SlotMetrics)
+    cached_routed_decode_token_slot_ids: tuple[int, ...] | None = None
+    cached_routed_decode_session: RoutedLoRADeltaSession | None = None
 
 
 class MOLAEngine:
+    _ROUTED_DECODE_SESSION_CACHE_LIMIT = 128
+
     def __init__(
         self,
         mola_model: MOLAModel,
@@ -249,12 +343,27 @@ class MOLAEngine:
         self.metrics.mixed_decode_migration_enabled = (
             self.config.enable_mixed_decode_migration
         )
+        self.metrics.prestep_mixed_decode_migration = (
+            self.config.prestep_mixed_decode_migration
+        )
+        self.metrics.detached_shared_decode_owner = (
+            self.config.detached_shared_decode_owner
+        )
+        self.metrics.cache_routed_decode_sessions = (
+            self.config.cache_routed_decode_sessions
+        )
+        self.metrics.neutralize_lora_delta = self.config.neutralize_lora_delta
         self.admission_policy = TokenBudgetAdmissionPolicy(self.config.max_inflight_tokens)
         self.scheduling_policy: WaitingAwareSchedulingPolicy[str | None] = (
             WaitingAwareSchedulingPolicy()
         )
         self._generator_factory = generator_factory or self._default_generator_factory
         self._routed_decode_session_factory = routed_decode_session_factory
+        self._mixed_decode_owner: DecodeOwner = self._default_mixed_decode_owner()
+        self._routed_decode_session_cache: OrderedDict[
+            tuple,
+            RoutedLoRADeltaSession,
+        ] = OrderedDict()
         self.model_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
@@ -300,6 +409,7 @@ class MOLAEngine:
             self._pending_by_queue.clear()
             self._generators.clear()
             self._reserved_tokens = 0
+            self._routed_decode_session_cache.clear()
             self.metrics.inflight_tokens_reserved = 0
             self.metrics.queued_requests = 0
             self.metrics.active_generators = 0
@@ -592,14 +702,131 @@ class MOLAEngine:
             )
         )
 
+    def _routed_view_signature(
+        self,
+        views: tuple[LayerSlotPackView, ...],
+    ) -> tuple:
+        return tuple(
+            (
+                view.layer_name,
+                view.slot_ids,
+                tuple(
+                    (id(entry.lora_a), id(entry.lora_b), entry.scale)
+                    for entry in view.entries
+                ),
+            )
+            for view in views
+        )
+
+    def _record_routed_decode_session_build(
+        self,
+        *,
+        mixed: bool,
+        build_ms: float,
+        cache_hit: bool,
+    ):
+        if mixed:
+            if cache_hit:
+                self.metrics.mixed_routed_decode_session_cache_hits += 1
+                return
+            self.metrics.mixed_routed_decode_session_builds += 1
+            self.metrics.mixed_routed_decode_session_build_ms_total += build_ms
+            return
+        if cache_hit:
+            self.metrics.homogeneous_routed_decode_session_cache_hits += 1
+            return
+        self.metrics.homogeneous_routed_decode_session_builds += 1
+        self.metrics.homogeneous_routed_decode_session_build_ms_total += build_ms
+
+    def _clear_slot_routed_decode_session_cache(self, slot: _AdapterSlot):
+        slot.cached_routed_decode_token_slot_ids = None
+        slot.cached_routed_decode_session = None
+
+    def _get_slot_cached_routed_decode_session(
+        self,
+        slot: _AdapterSlot,
+        token_slot_ids: tuple[int, ...],
+        *,
+        mixed: bool,
+    ) -> RoutedLoRADeltaSession | None:
+        if not self.config.cache_routed_decode_sessions:
+            return None
+        if slot.cached_routed_decode_session is None:
+            return None
+        if slot.cached_routed_decode_token_slot_ids != token_slot_ids:
+            return None
+        self._record_routed_decode_session_build(
+            mixed=mixed,
+            build_ms=0.0,
+            cache_hit=True,
+        )
+        return slot.cached_routed_decode_session
+
+    def _store_slot_routed_decode_session(
+        self,
+        slot: _AdapterSlot,
+        token_slot_ids: tuple[int, ...],
+        session: RoutedLoRADeltaSession,
+    ):
+        if not self.config.cache_routed_decode_sessions:
+            return
+        slot.cached_routed_decode_token_slot_ids = token_slot_ids
+        slot.cached_routed_decode_session = session
+
+    def _build_cached_routed_decode_session(
+        self,
+        token_slot_ids: tuple[int, ...],
+        *,
+        mixed: bool,
+    ) -> RoutedLoRADeltaSession:
+        views = self.routed_layer_slot_pack_views(token_slot_ids=token_slot_ids)
+        cache_key = None
+        if self.config.cache_routed_decode_sessions:
+            cache_key = (
+                token_slot_ids,
+                self._routed_view_signature(views),
+            )
+            cached = self._routed_decode_session_cache.get(cache_key)
+            if cached is not None:
+                self._routed_decode_session_cache.move_to_end(cache_key)
+                self._record_routed_decode_session_build(
+                    mixed=mixed,
+                    build_ms=0.0,
+                    cache_hit=True,
+                )
+                return cached
+
+        build_start = time.monotonic()
+        session = self._get_routed_decode_session_factory().build(
+            views,
+            token_slot_ids,
+        )
+        build_ms = (time.monotonic() - build_start) * 1000
+        self._record_routed_decode_session_build(
+            mixed=mixed,
+            build_ms=build_ms,
+            cache_hit=False,
+        )
+        if cache_key is not None:
+            self._routed_decode_session_cache[cache_key] = session
+            self._routed_decode_session_cache.move_to_end(cache_key)
+            while (
+                len(self._routed_decode_session_cache)
+                > self._ROUTED_DECODE_SESSION_CACHE_LIMIT
+            ):
+                self._routed_decode_session_cache.popitem(last=False)
+        return session
+
     def build_routed_decode_session(
         self,
         token_slot_ids: list[int] | tuple[int, ...],
+        *,
+        mixed: bool = False,
     ) -> RoutedLoRADeltaSession:
         token_slot_ids = tuple(token_slot_ids)
-        return self._get_routed_decode_session_factory().build(
-            self.routed_layer_slot_pack_views(token_slot_ids=token_slot_ids),
+        return self._build_cached_routed_decode_session(
             token_slot_ids,
+            mixed=mixed,
         )
 
     def decode_row_bindings(self) -> tuple[DecodeRowBinding, ...]:
@@ -612,7 +839,7 @@ class MOLAEngine:
             if generator_key in seen_generator_keys:
                 continue
             if generator_key == MIXED_DECODE_ADAPTER_ID:
-                for handle in slot.generator.active_handles():
+                for handle in self._mixed_decode_owner.active_handles(slot):
                     req = self._uid_to_request.get(
                         self._request_key(generator_key, handle.uid)
                     )
@@ -652,6 +879,7 @@ class MOLAEngine:
         token_slot_ids = tuple(binding.slot_id for binding in row_bindings)
         return self.build_routed_decode_session(
             token_slot_ids,
+            mixed=True,
         )
 
     def build_homogeneous_decode_session(
@@ -663,6 +891,7 @@ class MOLAEngine:
         token_slot_ids = () if runtime_slot_id is None else (runtime_slot_id,) * token_count
         return self.build_routed_decode_session(
             token_slot_ids,
+            mixed=False,
         )
 
     def _build_homogeneous_decode_routed_session_for_slot(
@@ -675,10 +904,20 @@ class MOLAEngine:
         runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
         if runtime_slot_id is None:
             return None
-        return self.build_homogeneous_decode_session(
+        token_slot_ids = (runtime_slot_id,) * len(handles)
+        cached = self._get_slot_cached_routed_decode_session(
+            slot,
+            token_slot_ids,
+            mixed=False,
+        )
+        if cached is not None:
+            return cached
+        session = self.build_homogeneous_decode_session(
             slot.adapter_id,
             len(handles),
         )
+        self._store_slot_routed_decode_session(slot, token_slot_ids, session)
+        return session
 
     def _maybe_build_homogeneous_decode_routed_session_for_slot_locked(
         self,
@@ -712,37 +951,28 @@ class MOLAEngine:
             self._process_cancelled()
             with self._state_lock:
                 self._accrue_service_debt_locked()
+            self._prestep_migrate_decode_ready_slots()
 
             any_active = False
-            ordered_slots = self._ordered_slots()
-            decode_slots = [slot for slot in ordered_slots if slot.active_uids]
-            prefill_slots = [slot for slot in ordered_slots if slot.pending_requests]
-
-            seen_generator_keys: set[GeneratorKey] = set()
-            for slot in decode_slots:
-                generator_key = self._slot_generator_key(slot)
-                if generator_key in seen_generator_keys:
-                    continue
-                if slot.adapter_id == MIXED_DECODE_ADAPTER_ID:
-                    self._step_mixed_decode_slot(slot)
-                else:
-                    self._step_slot(slot)
+            decode_active = self._step_decode_iteration()
+            if decode_active:
                 any_active = True
-                seen_generator_keys.add(generator_key)
+            ordered_slots = self._ordered_slots()
+            prefill_slots = [slot for slot in ordered_slots if slot.pending_requests]
 
             allow_prefill = self._should_run_prefill(
                 iteration=iteration,
-                has_decode=bool(decode_slots),
+                has_decode=decode_active,
             )
             inserted_slots: list[_AdapterSlot] = []
             if allow_prefill:
-                limit = self._prefill_limit(has_decode=bool(decode_slots))
+                limit = self._prefill_limit(has_decode=decode_active)
                 for slot in prefill_slots[:limit]:
                     if self._insert_pending(slot):
                         inserted_slots.append(slot)
                         any_active = True
 
-            if not decode_slots:
+            if not decode_active:
                 for slot in inserted_slots:
                     self._step_slot(slot)
                     any_active = True
@@ -754,6 +984,21 @@ class MOLAEngine:
 
             if not any_active:
                 time.sleep(0.001)
+
+    def _step_decode_iteration(self) -> bool:
+        ordered_slots = self._ordered_slots()
+        decode_slots = [slot for slot in ordered_slots if slot.active_uids]
+        if not decode_slots:
+            return False
+
+        seen_generator_keys: set[GeneratorKey] = set()
+        for slot in decode_slots:
+            generator_key = self._slot_generator_key(slot)
+            if generator_key in seen_generator_keys:
+                continue
+            self._step_slot(slot)
+            seen_generator_keys.add(generator_key)
+        return bool(seen_generator_keys)
 
     def _drain_requests(self):
         drained = 0
@@ -1019,6 +1264,9 @@ class MOLAEngine:
             f"unsupported routed_decode_backend: {self.config.routed_decode_backend}"
         )
 
+    def _default_mixed_decode_owner(self) -> DecodeOwner:
+        return SharedMixedSlotDecodeOwner(self)
+
     def _get_routed_decode_session_factory(self) -> RoutedLoRADeltaSessionFactory:
         if self._routed_decode_session_factory is None:
             self._routed_decode_session_factory = self._default_routed_decode_session_factory()
@@ -1065,383 +1313,28 @@ class MOLAEngine:
         )
 
     def _migrate_decode_ready_from_slot(self, slot: _AdapterSlot):
-        if not self._should_use_mixed_decode_migration(slot.adapter_id):
-            return
-        if slot.adapter_id is None or slot.adapter_id == MIXED_DECODE_ADAPTER_ID:
-            return
+        self._mixed_decode_owner.admit_decode_ready_from_slot(slot)
 
-        with self._state_lock:
-            if not self._should_migrate_decode_slot_locked(slot):
-                return
-
-        generator_key = self._slot_generator_key(slot)
-        handles = [
-            handle
-            for handle in slot.generator.active_handles()
-            if handle.uid in slot.active_uids
-        ]
-        if not handles:
-            return
-
-        states = slot.generator.take_states(handles)
-        if not states:
-            return
-
-        shared_slot = self._get_or_create_mixed_decode_slot()
-        try:
-            restored_handles = shared_slot.generator.restore_states(states)
-        except Exception:
-            rollback_handles = slot.generator.restore_states(states)
-            with self._state_lock:
-                for old_handle, rollback_handle in zip(
-                    handles, rollback_handles, strict=True
-                ):
-                    req = self._uid_to_request.pop(
-                        self._request_key(generator_key, old_handle.uid), None
-                    )
-                    if req is None:
-                        continue
-                    slot.active_uids.discard(old_handle.uid)
-                    req.uid = rollback_handle.uid
-                    self._uid_to_request[
-                        self._slot_request_key(slot, rollback_handle.uid)
-                    ] = req
-                    slot.active_uids.add(rollback_handle.uid)
-                self._update_sequence_count_locked()
-            raise
-
-        now = time.time()
-        with self._state_lock:
-            for old_handle, new_handle in zip(handles, restored_handles, strict=True):
-                req = self._uid_to_request.pop(
-                    self._request_key(generator_key, old_handle.uid), None
-                )
-                if req is None:
-                    continue
-                slot.active_uids.discard(old_handle.uid)
-                req.uid = new_handle.uid
-                self._uid_to_request[
-                    self._slot_request_key(shared_slot, new_handle.uid)
-                ] = req
-                shared_slot.active_uids.add(new_handle.uid)
-            if not slot.active_uids and not slot.pending_requests:
-                slot.service_debt = 0.0
-            shared_slot.last_active = now
-            shared_slot.last_service_ts = now
-            self.metrics.mixed_decode_migration_events += 1
-            self.metrics.mixed_decode_migrated_sequences += len(restored_handles)
-            self.metrics.active_generators = self._generator_count_locked()
-            self._update_sequence_count_locked()
-        logger.debug(
-            "migrate_decode adapter=%s count=%s shared_active=%s",
-            slot.adapter_id,
-            len(restored_handles),
-            len(shared_slot.active_uids),
-        )
+    def _prestep_migrate_decode_ready_slots(self):
+        self._mixed_decode_owner.prestep_admit_decode_ready_slots()
 
     def _restore_mixed_decode_slot_to_source_generators(
         self,
         slot: _AdapterSlot,
     ) -> bool:
-        if slot.adapter_id != MIXED_DECODE_ADAPTER_ID:
-            return False
-
-        handles = [
-            handle
-            for handle in slot.generator.active_handles()
-            if handle.uid in slot.active_uids
-        ]
-        if not handles:
-            return True
-
-        states = slot.generator.take_states(handles)
-        if not states:
-            return True
-
-        handle_reqs: list[GenerateRequest] = []
-        with self._state_lock:
-            for handle in handles:
-                req = self._uid_to_request.get(self._slot_request_key(slot, handle.uid))
-                if req is None or req.adapter_id is None:
-                    logger.error(
-                        "mixed decode restore missing request binding for uid=%s",
-                        handle.uid,
-                    )
-                    rollback_handles = slot.generator.restore_states(states)
-                    for old_handle, rollback_handle in zip(
-                        handles, rollback_handles, strict=True
-                    ):
-                        req = self._uid_to_request.pop(
-                            self._slot_request_key(slot, old_handle.uid), None
-                        )
-                        if req is None:
-                            continue
-                        slot.active_uids.discard(old_handle.uid)
-                        req.uid = rollback_handle.uid
-                        self._uid_to_request[
-                            self._slot_request_key(slot, rollback_handle.uid)
-                        ] = req
-                        slot.active_uids.add(rollback_handle.uid)
-                    self._update_sequence_count_locked()
-                    return False
-                handle_reqs.append(req)
-
-        groups: dict[str, list[tuple[GeneratorState, GenerateRequest]]] = {}
-        for state, req in zip(states, handle_reqs, strict=True):
-            assert req.adapter_id is not None
-            groups.setdefault(req.adapter_id, []).append((state, req))
-
-        restored_groups: list[
-            tuple[_AdapterSlot, list[tuple[GeneratorState, GenerateRequest]], list[GeneratorHandle]]
-        ] = []
-        try:
-            for adapter_id, entries in groups.items():
-                source_slot = self._get_or_create_slot(adapter_id)
-                restored_handles = source_slot.generator.restore_states(
-                    [state for state, _ in entries]
-                )
-                restored_groups.append((source_slot, entries, restored_handles))
-        except Exception:
-            logger.exception("mixed decode restore to source generators failed")
-            for source_slot, _entries, restored_handles in restored_groups:
-                try:
-                    source_slot.generator.take_states(restored_handles)
-                except Exception:
-                    logger.exception(
-                        "mixed decode rollback cleanup failed for adapter '%s'",
-                        source_slot.adapter_id,
-                    )
-            try:
-                rollback_handles = slot.generator.restore_states(states)
-            except Exception:
-                logger.exception("mixed decode rollback to shared slot failed")
-                return False
-            with self._state_lock:
-                for old_handle, rollback_handle, req in zip(
-                    handles, rollback_handles, handle_reqs, strict=True
-                ):
-                    self._uid_to_request.pop(
-                        self._slot_request_key(slot, old_handle.uid), None
-                    )
-                    slot.active_uids.discard(old_handle.uid)
-                    req.uid = rollback_handle.uid
-                    self._uid_to_request[
-                        self._slot_request_key(slot, rollback_handle.uid)
-                    ] = req
-                    slot.active_uids.add(rollback_handle.uid)
-                self._update_sequence_count_locked()
-            return False
-
-        now = time.time()
-        with self._state_lock:
-            for old_handle in handles:
-                self._uid_to_request.pop(self._slot_request_key(slot, old_handle.uid), None)
-                slot.active_uids.discard(old_handle.uid)
-            if not slot.active_uids and not slot.pending_requests:
-                slot.service_debt = 0.0
-            for source_slot, entries, restored_handles in restored_groups:
-                for (_state, req), restored_handle in zip(
-                    entries, restored_handles, strict=True
-                ):
-                    req.uid = restored_handle.uid
-                    self._uid_to_request[
-                        self._slot_request_key(source_slot, restored_handle.uid)
-                    ] = req
-                    source_slot.active_uids.add(restored_handle.uid)
-                    source_slot.last_active = now
-                    source_slot.last_service_ts = now
-            self.metrics.active_generators = self._generator_count_locked()
-            self._update_sequence_count_locked()
-        logger.debug(
-            "mixed_decode_restore count=%s source_slots=%s",
-            len(handles),
-            [slot.adapter_id for slot, *_ in restored_groups],
-        )
-        return True
+        return self._mixed_decode_owner.restore_to_source_generators(slot)
 
     def _build_mixed_decode_routed_session_for_slot_locked(
         self,
         slot: _AdapterSlot,
     ) -> RoutedLoRADeltaSession | None:
-        if slot.adapter_id != MIXED_DECODE_ADAPTER_ID:
-            return None
-        if not self.config.enable_routed_decode_reference:
-            return None
-
-        token_slot_ids: list[int] = []
-        for handle in slot.generator.active_handles():
-            req = self._uid_to_request.get(self._slot_request_key(slot, handle.uid))
-            if req is None or req.adapter_id is None or req.first_token_at is None:
-                return None
-            runtime_slot_id = self._adapter_slot_id(req.adapter_id)
-            if runtime_slot_id is None:
-                return None
-            token_slot_ids.append(runtime_slot_id)
-        if not token_slot_ids:
-            return None
-        return self.build_routed_decode_session(token_slot_ids)
+        return self._mixed_decode_owner.build_routed_session(slot)
 
     def _step_mixed_decode_slot(self, slot: _AdapterSlot):
-        with self._state_lock:
-            active_count = len(slot.active_uids)
-        if not active_count:
-            return
-
-        logger.debug(
-            f"slot_step_start adapter={slot.adapter_id} active={active_count}"
-        )
-        lock_wait_start = time.monotonic()
-        with self.model_lock:
-            lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
-            try:
-                routed_session = self._build_mixed_decode_routed_session_for_slot_locked(
-                    slot
-                )
-            except RoutedDecodeContractError:
-                logger.exception("Mixed routed decode contract error")
-                if self._restore_mixed_decode_slot_to_source_generators(slot):
-                    return
-                self._fail_slot(slot, "internal error")
-                return
-            except Exception:
-                logger.exception("Mixed routed decode backend unavailable; falling back")
-                if self._restore_mixed_decode_slot_to_source_generators(slot):
-                    return
-                self._fail_slot(slot, "internal error")
-                return
-            if routed_session is None:
-                if self._restore_mixed_decode_slot_to_source_generators(slot):
-                    return
-                self._fail_slot(slot, "internal error")
-                return
-            t0 = time.monotonic()
-            with adapter_context(None, slot_id=None):
-                with routed_decode_context(routed_session):
-                    try:
-                        responses = slot.generator.step()
-                    except StopIteration:
-                        return
-                    except Exception:
-                        logger.exception("Mixed decode BatchGenerator error")
-                        if self._restore_mixed_decode_slot_to_source_generators(slot):
-                            return
-                        self._fail_slot(slot, "internal error")
-                        return
-        step_ms = (time.monotonic() - t0) * 1000
-
-        finished_uids = set()
-        resp_uids = []
-        resp_reasons = []
-        for resp in responses:
-            resp_uids.append(resp.handle.uid)
-            resp_reasons.append(resp.finish_reason)
-            self._dispatch_token(
-                self._slot_generator_key(slot),
-                resp.handle.uid,
-                resp.token,
-                resp.finish_reason,
-            )
-            if resp.finish_reason is not None:
-                finished_uids.add(resp.handle.uid)
-
-        with self._state_lock:
-            slot.slot_metrics.record_step(step_ms, lock_wait_ms, len(responses))
-            self.metrics.total_step_lock_wait_ms += lock_wait_ms
-            self.metrics.mixed_decode_steps += 1
-            self.metrics.mixed_decode_rows += len(responses)
-            slot.service_debt = max(0.0, slot.service_debt - 1.0)
-            slot.last_active = time.time()
-            slot.last_service_ts = slot.last_active
-            slot.active_uids -= finished_uids
-            if not slot.active_uids and not slot.pending_requests:
-                slot.service_debt = 0.0
-            self._update_sequence_count_locked()
-        logger.debug(
-            f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
-            f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f} "
-            f"lock_wait_ms={lock_wait_ms:.1f}"
-        )
+        self._mixed_decode_owner.step(slot)
 
     def _step_slot(self, slot: _AdapterSlot):
-        with self._state_lock:
-            active_count = len(slot.active_uids)
-        if not active_count:
-            return
-
-        logger.debug(
-            f"slot_step_start adapter={slot.adapter_id} active={active_count}"
-        )
-        runtime_slot_id = self._adapter_slot_id(slot.adapter_id)
-        lock_wait_start = time.monotonic()
-        with self.model_lock:
-            lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
-            try:
-                routed_session = self._maybe_build_homogeneous_decode_routed_session_for_slot_locked(slot)
-            except RoutedDecodeContractError:
-                logger.exception(
-                    "Routed decode contract error for adapter '%s'",
-                    slot.adapter_id,
-                )
-                self._fail_slot(slot, "internal error")
-                return
-            except Exception:
-                logger.exception(
-                    "Routed decode backend unavailable for adapter '%s'; falling back",
-                    slot.adapter_id,
-                )
-                routed_session = None
-            t0 = time.monotonic()
-            with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
-                with routed_decode_context(routed_session):
-                    try:
-                        responses = slot.generator.step()
-                    except StopIteration:
-                        return
-                    except Exception:
-                        logger.exception(
-                            f"BatchGenerator error for adapter '{slot.adapter_id}'"
-                        )
-                        self._fail_slot(slot, "internal error")
-                        return
-        step_ms = (time.monotonic() - t0) * 1000
-
-        finished_uids = set()
-        resp_uids = []
-        resp_reasons = []
-        for resp in responses:
-            resp_uids.append(resp.handle.uid)
-            resp_reasons.append(resp.finish_reason)
-            self._dispatch_token(
-                self._slot_generator_key(slot),
-                resp.handle.uid,
-                resp.token,
-                resp.finish_reason,
-            )
-            if resp.finish_reason is not None:
-                finished_uids.add(resp.handle.uid)
-
-        with self._state_lock:
-            slot.slot_metrics.record_step(step_ms, lock_wait_ms, len(responses))
-            self.metrics.total_step_lock_wait_ms += lock_wait_ms
-            slot.service_debt = max(0.0, slot.service_debt - 1.0)
-            slot.last_active = time.time()
-            slot.last_service_ts = slot.last_active
-            slot.active_uids -= finished_uids
-            if not slot.active_uids and not slot.pending_requests:
-                slot.service_debt = 0.0
-            self._update_sequence_count_locked()
-        logger.debug(
-            f"slot_step_done adapter={slot.adapter_id} responses={len(responses)} "
-            f"uids={resp_uids} reasons={resp_reasons} next_ms={step_ms:.1f} "
-            f"lock_wait_ms={lock_wait_ms:.1f} runtime_slot_id={runtime_slot_id}"
-        )
-        try:
-            self._migrate_decode_ready_from_slot(slot)
-        except Exception:
-            logger.exception(
-                "Mixed decode migration failed for adapter '%s'",
-                slot.adapter_id,
-            )
+        self._mixed_decode_owner.step(slot)
 
     def _should_run_prefill(self, *, iteration: int, has_decode: bool) -> bool:
         if not has_decode:
@@ -1472,6 +1365,7 @@ class MOLAEngine:
 
     def _insert_pending(self, slot: _AdapterSlot) -> bool:
         with self._state_lock:
+            decode_active = self._active_decode_generator_count_locked() > 0
             capacity = self.config.max_batch_size - len(slot.active_uids)
             if capacity <= 0:
                 return False
@@ -1498,9 +1392,12 @@ class MOLAEngine:
                 lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
                 t0 = time.monotonic()
                 with adapter_context(slot.adapter_id, slot_id=runtime_slot_id):
-                    handles = slot.generator.submit_batch(
-                        [req.to_submission() for req in batch]
-                    )
+                    with lora_delta_context(
+                        neutralize=self.config.neutralize_lora_delta
+                    ):
+                        handles = slot.generator.submit_batch(
+                            [req.to_submission() for req in batch]
+                        )
             insert_ms = (time.monotonic() - t0) * 1000
         except Exception:
             logger.exception(f"BatchGenerator insert error for adapter '{slot.adapter_id}'")
@@ -1517,6 +1414,13 @@ class MOLAEngine:
         with self._state_lock:
             slot.slot_metrics.record_insert(insert_ms, lock_wait_ms, len(batch))
             self.metrics.total_insert_lock_wait_ms += lock_wait_ms
+            self.metrics.prefill_insert_batches += 1
+            self.metrics.prefill_insert_requests += len(batch)
+            if decode_active:
+                self.metrics.prefill_insert_batches_while_decode += 1
+                self.metrics.prefill_insert_requests_while_decode += len(batch)
+            if len(batch) == 1:
+                self.metrics.prefill_insert_single_batches += 1
             for req, handle in zip(batch, handles, strict=True):
                 uid = handle.uid
                 req.uid = uid
@@ -1541,6 +1445,15 @@ class MOLAEngine:
     def _queued_request_count_locked(self) -> int:
         return self._request_queue.qsize() + sum(
             len(slot.pending_requests) for slot in self._generators.values()
+        )
+
+    def _active_decode_generator_count_locked(self) -> int:
+        return len(
+            {
+                self._slot_generator_key(slot)
+                for slot in self._generators.values()
+                if slot.active_uids
+            }
         )
 
     def _release_budget_locked(self, req: GenerateRequest):

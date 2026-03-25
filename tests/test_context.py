@@ -1,6 +1,6 @@
 """Tests for adapter context threading."""
 
-from mola.context import adapter_context, get_current_adapter, get_current_routed_decode_session, get_current_slot_id, routed_decode_context
+from mola.context import adapter_context, get_current_adapter, get_current_neutralize_lora_delta, get_current_routed_decode_session, get_current_slot_id, lora_delta_context, routed_decode_context
 
 
 class TestAdapterContext:
@@ -8,6 +8,7 @@ class TestAdapterContext:
         assert get_current_adapter() is None
         assert get_current_slot_id() is None
         assert get_current_routed_decode_session() is None
+        assert get_current_neutralize_lora_delta() is False
 
     def test_context_sets_adapter(self):
         with adapter_context("solana", slot_id=3):
@@ -48,3 +49,16 @@ class TestAdapterContext:
                 assert get_current_routed_decode_session() is inner
             assert get_current_routed_decode_session() is outer
         assert get_current_routed_decode_session() is None
+
+    def test_lora_delta_context_sets_flag(self):
+        with lora_delta_context(neutralize=True):
+            assert get_current_neutralize_lora_delta() is True
+        assert get_current_neutralize_lora_delta() is False
+
+    def test_nested_lora_delta_contexts_restore_outer_flag(self):
+        with lora_delta_context(neutralize=True):
+            assert get_current_neutralize_lora_delta() is True
+            with lora_delta_context(neutralize=False):
+                assert get_current_neutralize_lora_delta() is False
+            assert get_current_neutralize_lora_delta() is True
+        assert get_current_neutralize_lora_delta() is False

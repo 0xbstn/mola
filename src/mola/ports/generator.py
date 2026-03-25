@@ -36,6 +36,31 @@ class GeneratorState:
     tokens: object
 
 
+@dataclass(frozen=True)
+class GeneratorBatchSnapshot:
+    """Decode-row-ordered snapshot of a generator active batch."""
+
+    states: tuple[GeneratorState, ...]
+
+
+@dataclass(frozen=True)
+class GeneratorDetachedBatch:
+    handles: tuple[GeneratorHandle, ...]
+    opaque: object
+
+
+@dataclass(frozen=True)
+class GeneratorBatchStepResult:
+    batch: GeneratorBatchSnapshot | None
+    events: tuple[GenerationEvent, ...]
+
+
+@dataclass(frozen=True)
+class GeneratorDetachedBatchStepResult:
+    batch: GeneratorDetachedBatch | None
+    events: tuple[GenerationEvent, ...]
+
+
 class GeneratorPort(Protocol):
     def submit_batch(
         self, requests: Sequence[GeneratorSubmission]
@@ -53,5 +78,39 @@ class GeneratorPort(Protocol):
     def restore_states(
         self, states: Sequence[GeneratorState]
     ) -> list[GeneratorHandle]: ...
+
+    def take_active_batch(self) -> GeneratorBatchSnapshot | None: ...
+
+    def restore_active_batch(
+        self, batch: GeneratorBatchSnapshot
+    ) -> tuple[GeneratorHandle, ...]: ...
+
+    def take_active_batch_handle(self) -> GeneratorDetachedBatch | None: ...
+
+    def restore_detached_batch(self, batch: GeneratorDetachedBatch) -> None: ...
+
+    def snapshot_detached_batch(
+        self, batch: GeneratorDetachedBatch
+    ) -> GeneratorBatchSnapshot: ...
+
+    def extend_detached_batch(
+        self,
+        batch: GeneratorDetachedBatch | None,
+        incoming: GeneratorBatchSnapshot,
+    ) -> tuple[GeneratorDetachedBatch, tuple[GeneratorHandle, ...]]: ...
+
+    def promote_detached_batch(
+        self,
+        batch: GeneratorDetachedBatch | None,
+        incoming: GeneratorDetachedBatch,
+    ) -> tuple[GeneratorDetachedBatch, tuple[GeneratorHandle, ...]]: ...
+
+    def step_batch(
+        self, batch: GeneratorBatchSnapshot
+    ) -> GeneratorBatchStepResult: ...
+
+    def step_detached_batch(
+        self, batch: GeneratorDetachedBatch
+    ) -> GeneratorDetachedBatchStepResult: ...
 
     def close(self) -> None: ...

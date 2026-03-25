@@ -22,7 +22,8 @@ import logging
 import mlx.core as mx
 import mlx.nn as nn
 
-from mola.context import get_current_adapter, get_current_routed_decode_session, get_current_slot_id
+from mola.context import get_current_adapter, get_current_neutralize_lora_delta, get_current_routed_decode_session, get_current_slot_id
+from mola.diagnostics import record_delta_invocation
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class MultiLoRALinear(nn.Module):
             return None
         return self._adapters.get(adapter_id)
 
-    def _routed_delta(self, x: mx.array) -> mx.array | None:
+    def _active_routed_decode_session(self):
         if self.layer_name is None:
             return None
         if not self._adapters_by_slot:
@@ -138,17 +139,37 @@ class MultiLoRALinear(nn.Module):
         routed_session = get_current_routed_decode_session()
         if routed_session is None:
             return None
-        return routed_session.delta(self.layer_name, x)
+        return routed_session
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.linear(x)
+        neutralize_delta = get_current_neutralize_lora_delta()
 
-        delta = self._routed_delta(x)
-        if delta is None:
+        delta = None
+        routed_session = self._active_routed_decode_session()
+        if routed_session is not None:
+            record_delta_invocation(
+                "routed",
+                x.shape[0],
+                neutralized=neutralize_delta,
+            )
+            if neutralize_delta:
+                delta = mx.zeros_like(y)
+            else:
+                delta = routed_session.delta(self.layer_name, x)
+        else:
             binding = self._active_binding()
             if binding is not None:
+                record_delta_invocation(
+                    "direct",
+                    x.shape[0],
+                    neutralized=neutralize_delta,
+                )
                 lora_a, lora_b, scale = binding
-                delta = scale * ((x @ lora_a) @ lora_b)
+                if neutralize_delta:
+                    delta = mx.zeros_like(y)
+                else:
+                    delta = scale * ((x @ lora_a) @ lora_b)
 
         if delta is not None:
             y = y + delta.astype(y.dtype)
@@ -225,14 +246,23 @@ class MultiLoRASwitchLinear(nn.Module):
 
         binding = self._active_binding()
         if binding is not None:
-            lora_a, lora_b, scale = binding
-            # Per-expert LoRA: lora_a is [num_experts, r, d_in]
-            delta = mx.gather_mm(
-                mx.gather_mm(x, lora_a, rhs_indices=indices),
-                lora_b,
-                rhs_indices=indices,
+            neutralize_delta = get_current_neutralize_lora_delta()
+            record_delta_invocation(
+                "direct",
+                x.shape[0],
+                neutralized=neutralize_delta,
             )
-            y = y + (scale * delta).astype(y.dtype)
+            lora_a, lora_b, scale = binding
+            if neutralize_delta:
+                delta = mx.zeros_like(y)
+            else:
+                delta = mx.gather_mm(
+                    mx.gather_mm(x, lora_a, rhs_indices=indices),
+                    lora_b,
+                    rhs_indices=indices,
+                )
+                delta = scale * delta
+            y = y + delta.astype(y.dtype)
 
         return y
 

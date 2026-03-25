@@ -8,13 +8,21 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mola.context import adapter_context, routed_decode_context
+from mola.context import adapter_context, lora_delta_context, routed_decode_context
+from mola.diagnostics import reset_delta_runtime_metrics, snapshot_delta_runtime_metrics
 from mola.lora import (
     MultiLoRALinear,
     apply_multi_lora,
     eject_adapter_weights,
     inject_adapter_weights,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_delta_metrics():
+    reset_delta_runtime_metrics()
+    yield
+    reset_delta_runtime_metrics()
 
 
 # --- MultiLoRALinear ---
@@ -165,6 +173,63 @@ class TestMultiLoRALinear:
         lora_b = mx.zeros((2, 16))  # output dim 16, base expects 4
         with pytest.raises(ValueError, match="output dim mismatch"):
             layer.add_adapter("bad", lora_a, lora_b, 1.0)
+
+    def test_direct_delta_neutralization_preserves_base_output(self):
+        reset_delta_runtime_metrics()
+        layer = self._make_layer(8, 4)
+        layer.add_adapter(
+            "test",
+            mx.ones((8, 2)) * 0.25,
+            mx.ones((2, 4)) * 0.25,
+            scale=1.0,
+        )
+        x = mx.ones((2, 8))
+        with adapter_context("test"):
+            y_enabled = layer(x)
+        with adapter_context("test"):
+            with lora_delta_context(neutralize=True):
+                y_neutralized = layer(x)
+        y_base = layer(x)
+
+        assert mx.allclose(y_neutralized, y_base)
+        assert not mx.allclose(y_enabled, y_base)
+        snap = snapshot_delta_runtime_metrics()
+        assert snap["delta_direct_calls"] >= 2
+        assert snap["delta_neutralized_direct_calls"] >= 1
+
+    def test_routed_delta_neutralization_preserves_base_output(self):
+        reset_delta_runtime_metrics()
+
+        class _Session:
+            def delta(self, layer_name, x):
+                return mx.ones((x.shape[0], 4)) * 3.0
+
+        layer = MultiLoRALinear(
+            nn.Linear(8, 4),
+            layer_name="model.layers.0.self_attn.q_proj",
+        )
+        layer.add_adapter(
+            "slot-bound",
+            mx.ones((8, 2)) * 0.25,
+            mx.ones((2, 4)) * 0.25,
+            scale=1.0,
+            slot_id=5,
+        )
+        x = mx.ones((2, 8))
+        y_base = layer(x)
+        with adapter_context(None, slot_id=5):
+            with routed_decode_context(_Session()):
+                y_routed = layer(x)
+        with adapter_context(None, slot_id=5):
+            with routed_decode_context(_Session()):
+                with lora_delta_context(neutralize=True):
+                    y_neutralized = layer(x)
+
+        assert not mx.allclose(y_routed, y_base)
+        assert mx.allclose(y_neutralized, y_base)
+        snap = snapshot_delta_runtime_metrics()
+        assert snap["delta_routed_calls"] >= 2
+        assert snap["delta_neutralized_routed_calls"] >= 1
 
 
 # --- inject/eject with a tiny mock model ---

@@ -55,6 +55,20 @@ def main(verbose: bool):
     help="Maximum prompt insertions per prefill wave",
 )
 @click.option(
+    "--prefill-interval",
+    default=2,
+    show_default=True,
+    type=int,
+    help="Run one prefill wave every N scheduler iterations while decode is active",
+)
+@click.option(
+    "--prefill-slot-limit",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Maximum adapter slots to prefill in one wave while decode is active",
+)
+@click.option(
     "--enable-routed-decode-reference",
     is_flag=True,
     help="Enable the experimental homogeneous routed-decode reference path",
@@ -76,6 +90,26 @@ def main(verbose: bool):
     is_flag=True,
     help="Experimentally migrate decode-ready adapted requests into a shared mixed decode generator",
 )
+@click.option(
+    "--prestep-mixed-decode-migration",
+    is_flag=True,
+    help="Migrate decode-ready slots into the shared mixed slot before the iteration's decode step order is executed",
+)
+@click.option(
+    "--detached-shared-decode-owner",
+    is_flag=True,
+    help="Keep the shared mixed decode batch detached under DecodeOwner instead of in the shared generator active batch",
+)
+@click.option(
+    "--cache-routed-decode-sessions",
+    is_flag=True,
+    help="Cache routed decode sessions by active slot composition for runtime diagnostics",
+)
+@click.option(
+    "--neutralize-lora-delta",
+    is_flag=True,
+    help="Keep the adapter/mixed runtime active but force LoRA deltas to zero for diagnostics",
+)
 def serve(
     model: str,
     adapter: tuple,
@@ -84,10 +118,16 @@ def serve(
     max_inflight_tokens: int,
     max_batch_size: int,
     prefill_batch_size: int,
+    prefill_interval: int,
+    prefill_slot_limit: int,
     enable_routed_decode_reference: bool,
     strict_routed_decode_reference: bool,
     routed_decode_backend: str,
     enable_mixed_decode_migration: bool,
+    prestep_mixed_decode_migration: bool,
+    detached_shared_decode_owner: bool,
+    cache_routed_decode_sessions: bool,
+    neutralize_lora_delta: bool,
 ):
     """Start the MOLA inference server."""
     import uvicorn
@@ -107,10 +147,16 @@ def serve(
             max_inflight_tokens=max_inflight_tokens,
             max_batch_size=max_batch_size,
             prefill_batch_size=prefill_batch_size,
+            prefill_interval=prefill_interval,
+            prefill_slot_limit=prefill_slot_limit,
             enable_routed_decode_reference=enable_routed_decode_reference,
             strict_routed_decode_reference=strict_routed_decode_reference,
             routed_decode_backend=routed_decode_backend,
             enable_mixed_decode_migration=enable_mixed_decode_migration,
+            prestep_mixed_decode_migration=prestep_mixed_decode_migration,
+            detached_shared_decode_owner=detached_shared_decode_owner,
+            cache_routed_decode_sessions=cache_routed_decode_sessions,
+            neutralize_lora_delta=neutralize_lora_delta,
         ),
     )
 
@@ -119,10 +165,16 @@ def serve(
     click.echo(f"  Adapters: {[name for name, _ in adapter] or ['none']}")
     click.echo(f"  Completion batch size: {max_batch_size}")
     click.echo(f"  Prefill batch size: {prefill_batch_size}")
+    click.echo(f"  Prefill interval: {prefill_interval}")
+    click.echo(f"  Prefill slot limit: {prefill_slot_limit}")
     click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode strict: {'on' if strict_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode backend: {routed_decode_backend}")
     click.echo(f"  Mixed decode migration: {'on' if enable_mixed_decode_migration else 'off'}")
+    click.echo(f"  Pre-step mixed decode migration: {'on' if prestep_mixed_decode_migration else 'off'}")
+    click.echo(f"  Detached shared decode owner: {'on' if detached_shared_decode_owner else 'off'}")
+    click.echo(f"  Cache routed decode sessions: {'on' if cache_routed_decode_sessions else 'off'}")
+    click.echo(f"  Neutralize LoRA delta: {'on' if neutralize_lora_delta else 'off'}")
     click.echo()
     click.echo("Endpoints:")
     click.echo(f"  POST   http://{host}:{port}/v1/chat/completions")

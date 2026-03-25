@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import math
+import random
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -67,6 +68,10 @@ class RequestResult:
 @dataclass
 class ScenarioResult:
     scenario: str
+    arrival_mode: str
+    arrival_rate: float
+    active_duration_s: float
+    drain_s: float
     concurrency: int
     requests: int
     wall_s: float
@@ -75,6 +80,8 @@ class ScenarioResult:
     req_s: float
     avg_chars: float
     errors: int
+    client_avg_inflight: float
+    client_peak_inflight: int
     engine_tokens: int
     engine_completed: int
     engine_tok_s: float
@@ -86,11 +93,49 @@ class ScenarioResult:
     engine_routed_decode_reference_strict: bool
     engine_routed_decode_backend: str
     engine_mixed_decode_migration_enabled: bool
+    engine_cache_routed_decode_sessions: bool
+    engine_neutralize_lora_delta: bool
     engine_mixed_decode_migration_events: int
     engine_mixed_decode_migrated_sequences: int
     engine_mixed_decode_steps: int
     engine_mixed_decode_rows: int
     engine_avg_mixed_decode_rows: float
+    engine_homogeneous_decode_steps: int
+    engine_homogeneous_decode_rows: int
+    engine_avg_homogeneous_decode_rows: float
+    engine_decode_step_samples: int
+    engine_decode_active_generators_total: int
+    engine_avg_decode_generators_active: float
+    engine_prefill_insert_batches: int
+    engine_prefill_insert_requests: int
+    engine_avg_prefill_insert_batch: float
+    engine_prefill_insert_batches_while_decode: int
+    engine_prefill_insert_requests_while_decode: int
+    engine_avg_prefill_insert_batch_while_decode: float
+    engine_prefill_insert_single_batches: int
+    engine_prefill_insert_single_batch_ratio: float
+    engine_homogeneous_routed_decode_session_builds: int
+    engine_homogeneous_routed_decode_session_cache_hits: int
+    engine_avg_homogeneous_routed_decode_session_build_ms: float
+    engine_mixed_routed_decode_session_builds: int
+    engine_mixed_routed_decode_session_cache_hits: int
+    engine_avg_mixed_routed_decode_session_build_ms: float
+    engine_avg_mixed_decode_migration_since_insert_ms: float
+    engine_avg_mixed_decode_migration_since_first_token_ms: float
+    engine_avg_mixed_decode_tokens_before_shared: float
+    engine_delta_total_calls: int
+    engine_delta_total_rows: int
+    engine_delta_avg_rows: float
+    engine_delta_direct_calls: int
+    engine_delta_direct_rows: int
+    engine_delta_avg_direct_rows: float
+    engine_delta_routed_calls: int
+    engine_delta_routed_rows: int
+    engine_delta_avg_routed_rows: float
+    engine_delta_neutralized_direct_calls: int
+    engine_delta_neutralized_direct_rows: int
+    engine_delta_neutralized_routed_calls: int
+    engine_delta_neutralized_routed_rows: int
     models: list[str]
 
 
@@ -107,6 +152,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--concurrency", default="1,2,4,8")
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument(
+        "--arrival-mode",
+        choices=["burst", "poisson"],
+        default="burst",
+        help="burst runs fixed concurrent waves; poisson runs continuous arrivals with a max in-flight cap",
+    )
+    parser.add_argument(
+        "--arrival-rate",
+        type=float,
+        default=None,
+        help="Average Poisson arrival rate in requests/sec; defaults to the concurrency value in poisson mode",
+    )
+    parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=20.0,
+        help="Per-repeat active arrival duration for poisson mode",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="Random seed for poisson arrivals",
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--same-model", default=None)
@@ -285,6 +354,100 @@ async def _run_wave(
     return await asyncio.gather(*tasks)
 
 
+@dataclass
+class _InflightTracker:
+    current: int = 0
+    peak: int = 0
+    area: float = 0.0
+    last_ts: float = 0.0
+
+    def start(self, now: float):
+        self.last_ts = now
+
+    def update(self, new_current: int, now: float):
+        self.area += self.current * (now - self.last_ts)
+        self.current = new_current
+        if self.current > self.peak:
+            self.peak = self.current
+        self.last_ts = now
+
+    def average(self, total_s: float) -> float:
+        if total_s <= 0:
+            return 0.0
+        return self.area / total_s
+
+
+async def _run_poisson_window(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    models: list[str],
+    base_model_path: str,
+    adapter_names: set[str],
+    max_inflight: int,
+    arrival_rate: float,
+    duration_s: float,
+    max_tokens: int,
+    prompt_mode: str,
+    request_index_offset: int,
+    rng: random.Random,
+) -> tuple[list[RequestResult], float, float, float, int]:
+    if arrival_rate <= 0:
+        raise ValueError("arrival_rate must be > 0 for poisson mode")
+
+    semaphore = asyncio.Semaphore(max_inflight)
+    tracker = _InflightTracker()
+    lock = asyncio.Lock()
+    results: list[RequestResult] = []
+    tasks: list[asyncio.Task[None]] = []
+    launches = 0
+    started = time.perf_counter()
+    tracker.start(started)
+
+    async def _one_request(local_index: int):
+        await semaphore.acquire()
+        async with lock:
+            tracker.update(tracker.current + 1, time.perf_counter())
+        try:
+            model = models[local_index % len(models)]
+            prompt = _build_prompt(
+                model,
+                request_index_offset + local_index,
+                base_model_path,
+                adapter_names,
+                prompt_mode,
+            )
+            result = await _post_chat(client, base_url, model, prompt, max_tokens)
+            results.append(result)
+        finally:
+            async with lock:
+                tracker.update(max(0, tracker.current - 1), time.perf_counter())
+            semaphore.release()
+
+    while True:
+        now = time.perf_counter()
+        if now - started >= duration_s:
+            break
+        tasks.append(asyncio.create_task(_one_request(launches)))
+        launches += 1
+        delay = rng.expovariate(arrival_rate)
+        remaining = duration_s - (time.perf_counter() - started)
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(delay, remaining))
+
+    active_duration_s = time.perf_counter() - started
+    if tasks:
+        await asyncio.gather(*tasks)
+    finished = time.perf_counter()
+    tracker.update(tracker.current, finished)
+    wall_s = finished - started
+    drain_s = max(0.0, wall_s - active_duration_s)
+    return results, wall_s, active_duration_s, drain_s, tracker.peak, tracker.average(
+        wall_s
+    )
+
+
 async def _run_scenario(
     client: httpx.AsyncClient,
     *,
@@ -297,25 +460,66 @@ async def _run_scenario(
     repeats: int,
     max_tokens: int,
     prompt_mode: str = "default",
+    arrival_mode: str = "burst",
+    arrival_rate: float | None = None,
+    duration_s: float = 20.0,
+    seed: int = 7,
 ) -> ScenarioResult:
     before = await _get_json(client, f"{base_url}/v1/engine/metrics")
-    started = time.perf_counter()
     results: list[RequestResult] = []
+    active_duration_total = 0.0
+    drain_total = 0.0
+    peak_inflight = 0
+    weighted_avg_inflight_area = 0.0
+    started = time.perf_counter()
 
-    for wave in range(repeats):
-        results.extend(
-            await _run_wave(
-                client,
-                base_url,
-                models,
-                base_model_path,
-                adapter_names,
-                concurrency,
-                max_tokens,
-                wave,
-                prompt_mode,
+    if arrival_mode == "burst":
+        for wave in range(repeats):
+            results.extend(
+                await _run_wave(
+                    client,
+                    base_url,
+                    models,
+                    base_model_path,
+                    adapter_names,
+                    concurrency,
+                    max_tokens,
+                    wave,
+                    prompt_mode,
+                )
             )
-        )
+    else:
+        rate = arrival_rate if arrival_rate is not None else float(concurrency)
+        rng = random.Random(seed)
+        request_offset = 0
+        for _wave in range(repeats):
+            (
+                wave_results,
+                wave_wall_s,
+                wave_active_s,
+                wave_drain_s,
+                wave_peak,
+                wave_avg_inflight,
+            ) = await _run_poisson_window(
+                client,
+                base_url=base_url,
+                models=models,
+                base_model_path=base_model_path,
+                adapter_names=adapter_names,
+                max_inflight=concurrency,
+                arrival_rate=rate,
+                duration_s=duration_s,
+                max_tokens=max_tokens,
+                prompt_mode=prompt_mode,
+                request_index_offset=request_offset,
+                rng=rng,
+            )
+            request_offset += len(wave_results)
+            results.extend(wave_results)
+            active_duration_total += wave_active_s
+            drain_total += wave_drain_s
+            peak_inflight = max(peak_inflight, wave_peak)
+            weighted_avg_inflight_area += wave_avg_inflight * wave_wall_s
 
     wall_s = time.perf_counter() - started
     after = await _get_json(client, f"{base_url}/v1/engine/metrics")
@@ -331,9 +535,123 @@ async def _run_scenario(
     insert_lock_wait_delta = (
         after.get("total_insert_lock_wait_ms", 0.0) - before.get("total_insert_lock_wait_ms", 0.0)
     )
+    mixed_migrated_delta = int(
+        after.get("mixed_decode_migrated_sequences", 0)
+        - before.get("mixed_decode_migrated_sequences", 0)
+    )
+    mixed_steps_delta = int(
+        after.get("mixed_decode_steps", 0)
+        - before.get("mixed_decode_steps", 0)
+    )
+    mixed_rows_delta = int(
+        after.get("mixed_decode_rows", 0)
+        - before.get("mixed_decode_rows", 0)
+    )
+    homogeneous_steps_delta = int(
+        after.get("homogeneous_decode_steps", 0)
+        - before.get("homogeneous_decode_steps", 0)
+    )
+    homogeneous_rows_delta = int(
+        after.get("homogeneous_decode_rows", 0)
+        - before.get("homogeneous_decode_rows", 0)
+    )
+    decode_step_samples_delta = int(
+        after.get("decode_step_samples", 0)
+        - before.get("decode_step_samples", 0)
+    )
+    decode_active_generators_total_delta = int(
+        after.get("decode_active_generators_total", 0)
+        - before.get("decode_active_generators_total", 0)
+    )
+    prefill_insert_batches_delta = int(
+        after.get("prefill_insert_batches", 0)
+        - before.get("prefill_insert_batches", 0)
+    )
+    prefill_insert_requests_delta = int(
+        after.get("prefill_insert_requests", 0)
+        - before.get("prefill_insert_requests", 0)
+    )
+    prefill_insert_batches_while_decode_delta = int(
+        after.get("prefill_insert_batches_while_decode", 0)
+        - before.get("prefill_insert_batches_while_decode", 0)
+    )
+    prefill_insert_requests_while_decode_delta = int(
+        after.get("prefill_insert_requests_while_decode", 0)
+        - before.get("prefill_insert_requests_while_decode", 0)
+    )
+    prefill_insert_single_batches_delta = int(
+        after.get("prefill_insert_single_batches", 0)
+        - before.get("prefill_insert_single_batches", 0)
+    )
+    mixed_migration_since_insert_ms_total_delta = (
+        after.get("mixed_decode_migration_since_insert_ms_total", 0.0)
+        - before.get("mixed_decode_migration_since_insert_ms_total", 0.0)
+    )
+    mixed_migration_since_first_token_ms_total_delta = (
+        after.get("mixed_decode_migration_since_first_token_ms_total", 0.0)
+        - before.get("mixed_decode_migration_since_first_token_ms_total", 0.0)
+    )
+    mixed_migration_tokens_before_shared_delta = int(
+        after.get("mixed_decode_migration_tokens_before_shared", 0)
+        - before.get("mixed_decode_migration_tokens_before_shared", 0)
+    )
+    delta_total_calls_delta = int(
+        after.get("delta_total_calls", 0)
+        - before.get("delta_total_calls", 0)
+    )
+    delta_total_rows_delta = int(
+        after.get("delta_total_rows", 0)
+        - before.get("delta_total_rows", 0)
+    )
+    delta_direct_calls_delta = int(
+        after.get("delta_direct_calls", 0)
+        - before.get("delta_direct_calls", 0)
+    )
+    delta_direct_rows_delta = int(
+        after.get("delta_direct_rows", 0)
+        - before.get("delta_direct_rows", 0)
+    )
+    delta_routed_calls_delta = int(
+        after.get("delta_routed_calls", 0)
+        - before.get("delta_routed_calls", 0)
+    )
+    delta_routed_rows_delta = int(
+        after.get("delta_routed_rows", 0)
+        - before.get("delta_routed_rows", 0)
+    )
+    delta_neutralized_direct_calls_delta = int(
+        after.get("delta_neutralized_direct_calls", 0)
+        - before.get("delta_neutralized_direct_calls", 0)
+    )
+    delta_neutralized_direct_rows_delta = int(
+        after.get("delta_neutralized_direct_rows", 0)
+        - before.get("delta_neutralized_direct_rows", 0)
+    )
+    delta_neutralized_routed_calls_delta = int(
+        after.get("delta_neutralized_routed_calls", 0)
+        - before.get("delta_neutralized_routed_calls", 0)
+    )
+    delta_neutralized_routed_rows_delta = int(
+        after.get("delta_neutralized_routed_rows", 0)
+        - before.get("delta_neutralized_routed_rows", 0)
+    )
+
+    if arrival_mode == "burst":
+        active_duration_total = wall_s
+        drain_total = 0.0
+        peak_inflight = concurrency if results else 0
+        avg_inflight = concurrency if results else 0.0
+    else:
+        avg_inflight = (
+            weighted_avg_inflight_area / wall_s if wall_s > 0 else 0.0
+        )
 
     return ScenarioResult(
         scenario=scenario,
+        arrival_mode=arrival_mode,
+        arrival_rate=float(arrival_rate if arrival_rate is not None else concurrency),
+        active_duration_s=active_duration_total,
+        drain_s=drain_total,
         concurrency=concurrency,
         requests=len(results),
         wall_s=wall_s,
@@ -342,6 +660,8 @@ async def _run_scenario(
         req_s=(len(results) / wall_s) if wall_s > 0 else 0.0,
         avg_chars=avg_chars,
         errors=errors,
+        client_avg_inflight=round(avg_inflight, 2),
+        client_peak_inflight=peak_inflight,
         engine_tokens=token_delta,
         engine_completed=completed_delta,
         engine_tok_s=(token_delta / wall_s) if wall_s > 0 else 0.0,
@@ -365,40 +685,139 @@ async def _run_scenario(
         engine_mixed_decode_migration_enabled=bool(
             after.get("mixed_decode_migration_enabled", False)
         ),
+        engine_cache_routed_decode_sessions=bool(
+            after.get("cache_routed_decode_sessions", False)
+        ),
+        engine_neutralize_lora_delta=bool(
+            after.get("neutralize_lora_delta", False)
+        ),
         engine_mixed_decode_migration_events=int(
             after.get("mixed_decode_migration_events", 0)
             - before.get("mixed_decode_migration_events", 0)
         ),
-        engine_mixed_decode_migrated_sequences=int(
-            after.get("mixed_decode_migrated_sequences", 0)
-            - before.get("mixed_decode_migrated_sequences", 0)
-        ),
-        engine_mixed_decode_steps=int(
-            after.get("mixed_decode_steps", 0)
-            - before.get("mixed_decode_steps", 0)
-        ),
-        engine_mixed_decode_rows=int(
-            after.get("mixed_decode_rows", 0)
-            - before.get("mixed_decode_rows", 0)
-        ),
+        engine_mixed_decode_migrated_sequences=mixed_migrated_delta,
+        engine_mixed_decode_steps=mixed_steps_delta,
+        engine_mixed_decode_rows=mixed_rows_delta,
         engine_avg_mixed_decode_rows=(
-            round(
-                (
-                    after.get("mixed_decode_rows", 0)
-                    - before.get("mixed_decode_rows", 0)
-                )
-                / (
-                    after.get("mixed_decode_steps", 0)
-                    - before.get("mixed_decode_steps", 0)
-                ),
-                2,
-            )
-            if (
-                after.get("mixed_decode_steps", 0)
-                - before.get("mixed_decode_steps", 0)
-            )
+            round(mixed_rows_delta / mixed_steps_delta, 2)
+            if mixed_steps_delta
             else 0.0
         ),
+        engine_homogeneous_decode_steps=homogeneous_steps_delta,
+        engine_homogeneous_decode_rows=homogeneous_rows_delta,
+        engine_avg_homogeneous_decode_rows=(
+            round(homogeneous_rows_delta / homogeneous_steps_delta, 2)
+            if homogeneous_steps_delta
+            else 0.0
+        ),
+        engine_decode_step_samples=decode_step_samples_delta,
+        engine_decode_active_generators_total=decode_active_generators_total_delta,
+        engine_avg_decode_generators_active=(
+            round(
+                decode_active_generators_total_delta / decode_step_samples_delta,
+                2,
+            )
+            if decode_step_samples_delta
+            else 0.0
+        ),
+        engine_prefill_insert_batches=prefill_insert_batches_delta,
+        engine_prefill_insert_requests=prefill_insert_requests_delta,
+        engine_avg_prefill_insert_batch=(
+            round(
+                prefill_insert_requests_delta / prefill_insert_batches_delta,
+                2,
+            )
+            if prefill_insert_batches_delta
+            else 0.0
+        ),
+        engine_prefill_insert_batches_while_decode=prefill_insert_batches_while_decode_delta,
+        engine_prefill_insert_requests_while_decode=prefill_insert_requests_while_decode_delta,
+        engine_avg_prefill_insert_batch_while_decode=(
+            round(
+                prefill_insert_requests_while_decode_delta
+                / prefill_insert_batches_while_decode_delta,
+                2,
+            )
+            if prefill_insert_batches_while_decode_delta
+            else 0.0
+        ),
+        engine_prefill_insert_single_batches=prefill_insert_single_batches_delta,
+        engine_prefill_insert_single_batch_ratio=(
+            round(
+                prefill_insert_single_batches_delta / prefill_insert_batches_delta,
+                3,
+            )
+            if prefill_insert_batches_delta
+            else 0.0
+        ),
+        engine_homogeneous_routed_decode_session_builds=int(
+            after.get("homogeneous_routed_decode_session_builds", 0)
+            - before.get("homogeneous_routed_decode_session_builds", 0)
+        ),
+        engine_homogeneous_routed_decode_session_cache_hits=int(
+            after.get("homogeneous_routed_decode_session_cache_hits", 0)
+            - before.get("homogeneous_routed_decode_session_cache_hits", 0)
+        ),
+        engine_avg_homogeneous_routed_decode_session_build_ms=float(
+            after.get("avg_homogeneous_routed_decode_session_build_ms", 0.0)
+        ),
+        engine_mixed_routed_decode_session_builds=int(
+            after.get("mixed_routed_decode_session_builds", 0)
+            - before.get("mixed_routed_decode_session_builds", 0)
+        ),
+        engine_mixed_routed_decode_session_cache_hits=int(
+            after.get("mixed_routed_decode_session_cache_hits", 0)
+            - before.get("mixed_routed_decode_session_cache_hits", 0)
+        ),
+        engine_avg_mixed_routed_decode_session_build_ms=float(
+            after.get("avg_mixed_routed_decode_session_build_ms", 0.0)
+        ),
+        engine_avg_mixed_decode_migration_since_insert_ms=(
+            round(mixed_migration_since_insert_ms_total_delta / mixed_migrated_delta, 2)
+            if mixed_migrated_delta
+            else 0.0
+        ),
+        engine_avg_mixed_decode_migration_since_first_token_ms=(
+            round(
+                mixed_migration_since_first_token_ms_total_delta / mixed_migrated_delta,
+                2,
+            )
+            if mixed_migrated_delta
+            else 0.0
+        ),
+        engine_avg_mixed_decode_tokens_before_shared=(
+            round(
+                mixed_migration_tokens_before_shared_delta / mixed_migrated_delta,
+                2,
+            )
+            if mixed_migrated_delta
+            else 0.0
+        ),
+        engine_delta_total_calls=delta_total_calls_delta,
+        engine_delta_total_rows=delta_total_rows_delta,
+        engine_delta_avg_rows=(
+            round(delta_total_rows_delta / delta_total_calls_delta, 2)
+            if delta_total_calls_delta
+            else 0.0
+        ),
+        engine_delta_direct_calls=delta_direct_calls_delta,
+        engine_delta_direct_rows=delta_direct_rows_delta,
+        engine_delta_avg_direct_rows=(
+            round(delta_direct_rows_delta / delta_direct_calls_delta, 2)
+            if delta_direct_calls_delta
+            else 0.0
+        ),
+        engine_delta_routed_calls=delta_routed_calls_delta,
+        engine_delta_routed_rows=delta_routed_rows_delta,
+        engine_delta_avg_routed_rows=(
+            round(delta_routed_rows_delta / delta_routed_calls_delta, 2)
+            if delta_routed_calls_delta
+            else 0.0
+        ),
+        engine_delta_neutralized_direct_calls=delta_neutralized_direct_calls_delta,
+        engine_delta_neutralized_direct_rows=delta_neutralized_direct_rows_delta,
+        engine_delta_neutralized_routed_calls=delta_neutralized_routed_calls_delta,
+        engine_delta_neutralized_routed_rows=delta_neutralized_routed_rows_delta,
         models=models,
     )
 
@@ -527,6 +946,10 @@ def _print_header(
     adapters: list[dict],
     scenarios: list[ScenarioSpec],
     engine_metrics: dict[str, Any],
+    *,
+    arrival_mode: str,
+    arrival_rate: float | None,
+    duration_s: float,
 ):
     print("=" * 88)
     print("MOLA v2 Benchmark")
@@ -546,6 +969,18 @@ def _print_header(
         "Routed decode backend: "
         f"{engine_metrics.get('routed_decode_backend', 'reference')}"
     )
+    print(
+        "Neutralize LoRA delta: "
+        f"{engine_metrics.get('neutralize_lora_delta', False)}"
+    )
+    if arrival_mode == "poisson":
+        print(
+            "Traffic mode: "
+            f"poisson arrivals, rate={arrival_rate if arrival_rate is not None else 'auto'} req/s, "
+            f"window={duration_s:.1f}s"
+        )
+    else:
+        print("Traffic mode: burst waves")
     print("Scenarios:")
     for scenario in scenarios:
         suffix = ""
@@ -557,15 +992,15 @@ def _print_header(
 
 def _print_results(results: list[ScenarioResult]):
     print(
-        f"{'scenario':<14} {'conc':>4} {'reqs':>4} {'wall_s':>8} "
-        f"{'p50_ms':>8} {'p95_ms':>8} {'req/s':>8} {'tok/s':>8} {'errs':>5}"
+        f"{'scenario':<18} {'conc':>4} {'reqs':>5} {'wall_s':>8} "
+        f"{'p50_ms':>8} {'p95_ms':>8} {'req/s':>8} {'tok/s':>8} {'inflt':>7} {'errs':>5}"
     )
     print("-" * 88)
     for row in results:
         print(
-            f"{row.scenario:<14} {row.concurrency:>4} {row.requests:>4} "
+            f"{row.scenario:<18} {row.concurrency:>4} {row.requests:>5} "
             f"{row.wall_s:>8.2f} {row.p50_ms:>8.1f} {row.p95_ms:>8.1f} "
-            f"{row.req_s:>8.1f} {row.engine_tok_s:>8.1f} {row.errors:>5}"
+            f"{row.req_s:>8.1f} {row.engine_tok_s:>8.1f} {row.client_avg_inflight:>7.1f} {row.errors:>5}"
         )
 
 
@@ -624,7 +1059,16 @@ async def main():
             )
         )
 
-        _print_header(args.base_url, health, adapters, scenarios, engine_metrics)
+        _print_header(
+            args.base_url,
+            health,
+            adapters,
+            scenarios,
+            engine_metrics,
+            arrival_mode=args.arrival_mode,
+            arrival_rate=args.arrival_rate,
+            duration_s=args.duration_s,
+        )
 
         if args.warmup > 0:
             print(f"Warming up with {args.warmup} request(s) on {same_model}...")
@@ -656,6 +1100,10 @@ async def main():
                         repeats=args.repeats,
                         max_tokens=scenario.max_tokens or args.max_tokens,
                         prompt_mode=scenario.prompt_mode,
+                        arrival_mode=args.arrival_mode,
+                        arrival_rate=args.arrival_rate,
+                        duration_s=args.duration_s,
+                        seed=args.seed,
                     )
                 )
 
