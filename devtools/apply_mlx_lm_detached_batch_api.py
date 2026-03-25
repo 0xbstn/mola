@@ -313,7 +313,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     changed = patch_generate_py(args.target)
-    print(f"{'patched' if changed else 'already-patched'}:{args.target}")
+    if changed:
+        print(f"Patched mlx_lm detached-batch API in {args.target}")
+    else:
+        print(f"mlx_lm detached-batch API already present in {args.target}")
     return 0
 
 

@@ -228,14 +228,14 @@ class MLXBatchGeneratorPort(GeneratorPort):
             return ()
         return tuple(self.restore_states(batch.states))
 
-    def take_active_batch_handle(self) -> GeneratorDetachedBatch | None:
+    def detach_active_batch(self) -> GeneratorDetachedBatch | None:
         if self._supports_public_detached_api():
             detached = self._generator.detach_active_batch()
             if detached is None:
                 return None
             return GeneratorDetachedBatch(
                 handles=tuple(GeneratorHandle(uid=uid) for uid in detached.uids),
-                opaque=detached,
+                backend_batch=detached,
             )
         batch = self._generator.active_batch
         if batch is None:
@@ -243,18 +243,18 @@ class MLXBatchGeneratorPort(GeneratorPort):
         self._generator.active_batch = None
         return GeneratorDetachedBatch(
             handles=self._handles_from_batch(batch),
-            opaque=batch,
+            backend_batch=batch,
         )
 
     def restore_detached_batch(self, batch: GeneratorDetachedBatch) -> None:
         if not batch.handles:
             return
         if self._supports_public_detached_api():
-            self._generator.restore_detached_batch(batch.opaque)
+            self._generator.restore_detached_batch(batch.backend_batch)
             return
         if self._generator.active_batch is not None:
             raise RuntimeError("cannot restore detached batch while active_batch is populated")
-        self._generator.active_batch = batch.opaque
+        self._generator.active_batch = batch.backend_batch
 
     def snapshot_detached_batch(
         self, batch: GeneratorDetachedBatch
@@ -262,9 +262,9 @@ class MLXBatchGeneratorPort(GeneratorPort):
         if self._supports_public_detached_api() and hasattr(
             self._generator, "snapshot_detached_batch"
         ):
-            raw_batch = self._generator.snapshot_detached_batch(batch.opaque)
+            raw_batch = self._generator.snapshot_detached_batch(batch.backend_batch)
             return self._snapshot_from_batch(raw_batch)
-        return self._snapshot_from_batch(batch.opaque)
+        return self._snapshot_from_batch(batch.backend_batch)
 
     def extend_detached_batch(
         self,
@@ -276,7 +276,7 @@ class MLXBatchGeneratorPort(GeneratorPort):
                 raise ValueError("cannot create detached batch from empty snapshot")
             return batch, ()
 
-        existing_batch = batch.opaque if batch is not None else None
+        existing_batch = batch.backend_batch if batch is not None else None
         existing_uids = existing_batch.uids if existing_batch is not None else ()
         extension_batch, restored_handles = self._build_batch(
             incoming.states,
@@ -291,7 +291,7 @@ class MLXBatchGeneratorPort(GeneratorPort):
         return (
             GeneratorDetachedBatch(
                 handles=self._handles_from_batch(merged_batch),
-                opaque=merged_batch,
+                backend_batch=merged_batch,
             ),
             tuple(restored_handles),
         )
@@ -303,15 +303,15 @@ class MLXBatchGeneratorPort(GeneratorPort):
     ) -> tuple[GeneratorDetachedBatch, tuple[GeneratorHandle, ...]]:
         if self._supports_public_detached_api():
             detached_batch, promoted_uids = self._generator.promote_detached_batch(
-                batch.opaque if batch is not None else None,
-                incoming.opaque,
+                batch.backend_batch if batch is not None else None,
+                incoming.backend_batch,
             )
             return (
                 GeneratorDetachedBatch(
                     handles=tuple(
                         GeneratorHandle(uid=uid) for uid in detached_batch.uids
                     ),
-                    opaque=detached_batch,
+                    backend_batch=detached_batch,
                 ),
                 tuple(GeneratorHandle(uid=uid) for uid in promoted_uids),
             )
@@ -320,8 +320,8 @@ class MLXBatchGeneratorPort(GeneratorPort):
                 raise ValueError("cannot create detached batch from empty detached source")
             return batch, ()
 
-        incoming_batch = incoming.opaque
-        existing_batch = batch.opaque if batch is not None else None
+        incoming_batch = incoming.backend_batch
+        existing_batch = batch.backend_batch if batch is not None else None
         existing_uids = existing_batch.uids if existing_batch is not None else ()
         next_uid = max(
             getattr(self._generator, "uid_count", 0),
@@ -344,7 +344,7 @@ class MLXBatchGeneratorPort(GeneratorPort):
         return (
             GeneratorDetachedBatch(
                 handles=self._handles_from_batch(merged_batch),
-                opaque=merged_batch,
+                backend_batch=merged_batch,
             ),
             promoted_handles,
         )
@@ -424,13 +424,13 @@ class MLXBatchGeneratorPort(GeneratorPort):
             return GeneratorDetachedBatchStepResult(batch=None, events=())
 
         if self._supports_public_detached_api():
-            detached_batch, responses = self._generator.step_detached_batch(batch.opaque)
+            detached_batch, responses = self._generator.step_detached_batch(batch.backend_batch)
             next_batch = (
                 GeneratorDetachedBatch(
                     handles=tuple(
                         GeneratorHandle(uid=uid) for uid in detached_batch.uids
                     ),
-                    opaque=detached_batch,
+                    backend_batch=detached_batch,
                 )
                 if detached_batch is not None
                 else None
@@ -449,7 +449,7 @@ class MLXBatchGeneratorPort(GeneratorPort):
 
         import mlx.core as mx
 
-        detached_batch = batch.opaque
+        detached_batch = batch.backend_batch
         y = detached_batch.y
         for i, toks in enumerate(detached_batch.tokens):
             next_token = y[i : i + 1]
@@ -504,7 +504,7 @@ class MLXBatchGeneratorPort(GeneratorPort):
             detached_batch.filter(keep_idx)
             next_batch = GeneratorDetachedBatch(
                 handles=self._handles_from_batch(detached_batch),
-                opaque=detached_batch,
+                backend_batch=detached_batch,
             )
 
         return GeneratorDetachedBatchStepResult(

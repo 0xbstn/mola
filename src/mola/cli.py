@@ -1,8 +1,8 @@
 """CLI entry point.
 
-    mola serve --model Qwen3.5-35B-A3B-4bit --adapter solana ./adapters/solana
+    mola serve --model mlx-community/Qwen2.5-0.5B-Instruct-4bit --adapter rust ./adapters/rust-lora
     mola adapters list
-    mola generate --adapter solana "Write a Solana transfer"
+    mola generate --adapter rust "Write a Rust iterator"
 """
 
 from __future__ import annotations

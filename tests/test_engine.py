@@ -1376,9 +1376,9 @@ class TestMixedDecodeMigration:
         req.first_token_at = time.time()
         source_generator = MagicMock()
         source_generator.active_handles.return_value = (GeneratorHandle(uid=7),)
-        source_generator.take_active_batch_handle.return_value = GeneratorDetachedBatch(
+        source_generator.detach_active_batch.return_value = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=7),),
-            opaque=object(),
+            backend_batch=object(),
         )
         source_slot = _AdapterSlot(
             generator=source_generator,
@@ -1389,7 +1389,7 @@ class TestMixedDecodeMigration:
         shared_generator.promote_detached_batch.return_value = (
             GeneratorDetachedBatch(
                 handles=(GeneratorHandle(uid=99), GeneratorHandle(uid=70)),
-                opaque=object(),
+                backend_batch=object(),
             ),
             (GeneratorHandle(uid=70),),
         )
@@ -1408,14 +1408,14 @@ class TestMixedDecodeMigration:
         engine._get_or_create_mixed_decode_slot = lambda: shared_slot
         engine._mixed_decode_owner.shared_detached_batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=99),),
-            opaque=object(),
+            backend_batch=object(),
         )
 
         engine._migrate_decode_ready_from_slot(source_slot)
 
         owner = engine._mixed_decode_owner
         assert isinstance(owner, SharedMixedSlotDecodeOwner)
-        source_generator.take_active_batch_handle.assert_called_once()
+        source_generator.detach_active_batch.assert_called_once()
         shared_generator.promote_detached_batch.assert_called_once()
         assert owner.shared_detached_batch is not None
         assert tuple(handle.uid for handle in owner.shared_detached_batch.handles) == (99, 70)
@@ -1861,7 +1861,7 @@ class TestMixedDecodeMigration:
         shared_generator.step_detached_batch.return_value = GeneratorDetachedBatchStepResult(
             batch=GeneratorDetachedBatch(
                 handles=(GeneratorHandle(uid=70),),
-                opaque=object(),
+                backend_batch=object(),
             ),
             events=(
                 SimpleNamespace(
@@ -1886,7 +1886,7 @@ class TestMixedDecodeMigration:
         engine._build_mixed_decode_routed_session_for_slot_locked = lambda _slot: object()
         engine._mixed_decode_owner.shared_detached_batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=70),),
-            opaque=object(),
+            backend_batch=object(),
         )
 
         engine._step_mixed_decode_slot(shared_slot)
@@ -1938,7 +1938,7 @@ class TestMixedDecodeMigration:
         )
         engine._mixed_decode_owner.shared_detached_batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=70),),
-            opaque=object(),
+            backend_batch=object(),
         )
 
         restored = engine._restore_mixed_decode_slot_to_source_generators(shared_slot)

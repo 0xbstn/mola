@@ -1,16 +1,7 @@
-"""Decode ownership seam for shared mixed decode.
+"""Decode coordination for shared and homogeneous adapter batches.
 
-Current coupling to ``engine`` is intentionally explicit:
-- request bookkeeping still lives in ``engine._uid_to_request``
-- slot lifecycle and cache invalidation helpers still live in ``engine``
-- the owner still drives an upstream ``BatchGenerator`` through the current
-  ``GeneratorPort`` contract (`step`, `take_states`, `restore_states`)
-- the next architectural widening point is batch-level ownership transfer on
-  the generator/runtime boundary, not more engine-local migration heuristics
-
-This module exists to move mixed decode ownership behind a replaceable boundary
-before any deeper runtime/generator refactor. It is not a performance layer by
-itself.
+`DecodeOwner` keeps decode control behind one boundary while the engine still
+owns request admission, request bookkeeping, and slot lifecycle.
 """
 
 from __future__ import annotations
@@ -478,7 +469,7 @@ class SharedMixedSlotDecodeOwner:
         generator_key = self.engine._slot_generator_key(slot)
         shared_slot = self.engine._get_or_create_mixed_decode_slot()
         if self._detached_shared_decode_enabled():
-            source_batch = slot.generator.take_active_batch_handle()
+            source_batch = slot.generator.detach_active_batch()
             if source_batch is None:
                 return
             handles = source_batch.handles

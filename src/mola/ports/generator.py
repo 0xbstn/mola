@@ -46,7 +46,7 @@ class GeneratorBatchSnapshot:
 @dataclass(frozen=True)
 class GeneratorDetachedBatch:
     handles: tuple[GeneratorHandle, ...]
-    opaque: object
+    backend_batch: object
 
 
 @dataclass(frozen=True)
@@ -85,7 +85,7 @@ class GeneratorPort(Protocol):
         self, batch: GeneratorBatchSnapshot
     ) -> tuple[GeneratorHandle, ...]: ...
 
-    def take_active_batch_handle(self) -> GeneratorDetachedBatch | None: ...
+    def detach_active_batch(self) -> GeneratorDetachedBatch | None: ...
 
     def restore_detached_batch(self, batch: GeneratorDetachedBatch) -> None: ...
 

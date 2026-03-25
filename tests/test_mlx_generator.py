@@ -396,7 +396,7 @@ class TestMLXBatchGeneratorPort:
         assert port._generator.active_batch.uids == [0, 1]
         assert port._generator.active_batch.y.tolist() == [101, 102]
 
-    def test_take_active_batch_handle_detaches_live_batch(self, monkeypatch):
+    def test_detach_active_batch_detaches_live_batch(self, monkeypatch):
         monkeypatch.setattr(mlx_generator, "_load_batch_generator_cls", lambda: FakeBatchGenerator)
         port = mlx_generator.MLXBatchGeneratorPort(
             object(),
@@ -418,11 +418,11 @@ class TestMLXBatchGeneratorPort:
         )
         port._generator.active_batch = active_batch
 
-        batch = port.take_active_batch_handle()
+        batch = port.detach_active_batch()
 
         assert isinstance(batch, GeneratorDetachedBatch)
         assert batch.handles == (GeneratorHandle(uid=7), GeneratorHandle(uid=9))
-        assert batch.opaque is active_batch
+        assert batch.backend_batch is active_batch
         assert port._generator.active_batch is None
 
     def test_restore_detached_batch_reinstalls_live_batch(self, monkeypatch):
@@ -447,7 +447,7 @@ class TestMLXBatchGeneratorPort:
         )
         batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=7),),
-            opaque=active_batch,
+            backend_batch=active_batch,
         )
 
         port.restore_detached_batch(batch)
@@ -465,7 +465,7 @@ class TestMLXBatchGeneratorPort:
         )
         batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=7), GeneratorHandle(uid=9)),
-            opaque=FakeActiveBatch(
+            backend_batch=FakeActiveBatch(
                 uids=[7, 9],
                 y=[101, 102],
                 logprobs=["lp-7", "lp-9"],
@@ -499,7 +499,7 @@ class TestMLXBatchGeneratorPort:
         )
         existing = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=99),),
-            opaque=FakeActiveBatch(
+            backend_batch=FakeActiveBatch(
                 uids=[99],
                 y=[111],
                 logprobs=["lp-99"],
@@ -531,8 +531,8 @@ class TestMLXBatchGeneratorPort:
 
         assert restored_handles == (GeneratorHandle(uid=100),)
         assert merged.handles == (GeneratorHandle(uid=99), GeneratorHandle(uid=100))
-        assert merged.opaque.uids == [99, 100]
-        assert merged.opaque.y.tolist() == [111, 101]
+        assert merged.backend_batch.uids == [99, 100]
+        assert merged.backend_batch.y.tolist() == [111, 101]
         assert port._generator.active_batch is None
 
     def test_promote_detached_batch_rekeys_incoming_live_batch_and_merges_in_place(self, monkeypatch):
@@ -546,7 +546,7 @@ class TestMLXBatchGeneratorPort:
         )
         existing = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=99),),
-            opaque=FakeActiveBatch(
+            backend_batch=FakeActiveBatch(
                 uids=[99],
                 y=[111],
                 logprobs=["lp-99"],
@@ -571,7 +571,7 @@ class TestMLXBatchGeneratorPort:
         )
         incoming = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=7),),
-            opaque=incoming_batch,
+            backend_batch=incoming_batch,
         )
 
         merged, promoted_handles = port.promote_detached_batch(existing, incoming)
@@ -579,8 +579,8 @@ class TestMLXBatchGeneratorPort:
         assert promoted_handles == (GeneratorHandle(uid=100),)
         assert merged.handles == (GeneratorHandle(uid=99), GeneratorHandle(uid=100))
         assert incoming_batch.uids == [100]
-        assert merged.opaque.uids == [99, 100]
-        assert merged.opaque.y.tolist() == [111, 101]
+        assert merged.backend_batch.uids == [99, 100]
+        assert merged.backend_batch.y.tolist() == [111, 101]
         assert port._generator.active_batch is None
 
     def test_step_batch_steps_detached_batch_without_touching_active_batch(self, monkeypatch):
@@ -679,7 +679,7 @@ class TestMLXBatchGeneratorPort:
         )
         batch = GeneratorDetachedBatch(
             handles=(GeneratorHandle(uid=7), GeneratorHandle(uid=9)),
-            opaque=active_batch,
+            backend_batch=active_batch,
         )
 
         result = port.step_detached_batch(batch)
@@ -699,20 +699,20 @@ class TestMLXBatchGeneratorPort:
         )
         assert result.batch is not None
         assert result.batch.handles == (GeneratorHandle(uid=7),)
-        assert result.batch.opaque is active_batch
-        assert result.batch.opaque.uids == [7]
-        if isinstance(result.batch.opaque.y, np.ndarray):
-            assert result.batch.opaque.y.tolist() == [200]
+        assert result.batch.backend_batch is active_batch
+        assert result.batch.backend_batch.uids == [7]
+        if isinstance(result.batch.backend_batch.y, np.ndarray):
+            assert result.batch.backend_batch.y.tolist() == [200]
         else:
-            assert result.batch.opaque.y.tolist() == [200]
-        assert result.batch.opaque.logprobs == ["logprobs-0"]
-        assert result.batch.opaque.max_tokens == [4]
-        assert result.batch.opaque.num_tokens == [2]
-        assert result.batch.opaque.cache == [["cache-7"]]
-        assert result.batch.opaque.samplers == ["sampler-7"]
-        assert result.batch.opaque.logits_processors == [["lp7"]]
+            assert result.batch.backend_batch.y.tolist() == [200]
+        assert result.batch.backend_batch.logprobs == ["logprobs-0"]
+        assert result.batch.backend_batch.max_tokens == [4]
+        assert result.batch.backend_batch.num_tokens == [2]
+        assert result.batch.backend_batch.cache == [["cache-7"]]
+        assert result.batch.backend_batch.samplers == ["sampler-7"]
+        assert result.batch.backend_batch.logits_processors == [["lp7"]]
         assert mx.array_equal(
-            result.batch.opaque.tokens[0],
+            result.batch.backend_batch.tokens[0],
             mx.array([1, 2, 3, 101], dtype=mx.int32),
         )
         assert port._generator.active_batch is None

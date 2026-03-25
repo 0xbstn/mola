@@ -38,7 +38,7 @@ class MOLAModel:
     """Base model + multiple LoRA adapters, ready to serve.
 
     Usage:
-        model = MOLAModel("mlx-community/Qwen3.5-35B-A3B-4bit")
+        model = MOLAModel("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
         model.load_adapter("rust", "./adapters/rust-lora")
         model.load_adapter("sql", "./adapters/sql-lora")
 
