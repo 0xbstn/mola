@@ -165,6 +165,12 @@ class TestEngineMetrics:
         )
         assert engine.metrics.snapshot()["routed_decode_backend"] == "gather-mm"
 
+    def test_engine_config_marks_metal_gather_routed_decode_backend_in_metrics(self):
+        engine = _make_engine(
+            config=EngineConfig(routed_decode_backend="metal-gather")
+        )
+        assert engine.metrics.snapshot()["routed_decode_backend"] == "metal-gather"
+
 
 class TestDefaultRoutedDecodeFactory:
     def test_default_routed_decode_factory_uses_reference_backend(self, monkeypatch):
@@ -198,6 +204,20 @@ class TestDefaultRoutedDecodeFactory:
         )
         monkeypatch.setitem(sys.modules, "mola.infrastructure.gather_mm_routed_decode", fake_module)
         engine = _make_engine(config=EngineConfig(routed_decode_backend="gather-mm"))
+
+        factory = engine._default_routed_decode_session_factory()
+
+        assert factory is fake_factory
+
+    def test_default_routed_decode_factory_uses_metal_gather_backend(self, monkeypatch):
+        fake_factory = object()
+        fake_module = SimpleNamespace(
+            MetalGatherRoutedLoRADeltaSessionFactory=lambda strict: fake_factory
+        )
+        monkeypatch.setitem(
+            sys.modules, "mola.infrastructure.metal_gather_routed_decode", fake_module
+        )
+        engine = _make_engine(config=EngineConfig(routed_decode_backend="metal-gather"))
 
         factory = engine._default_routed_decode_session_factory()
 

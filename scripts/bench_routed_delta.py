@@ -29,15 +29,19 @@ class Result:
     dtype: str
     ref_ms: float
     gather_ms: float | None
+    hybrid_ba_ms: float | None
     gather_sorted_ms: float | None
     metal_ms: float | None
     gather_speedup: float | None
+    hybrid_ba_speedup: float | None
     gather_sorted_speedup: float | None
     metal_speedup: float | None
     max_abs_err_gather: float
+    max_abs_err_hybrid_ba: float | None
     max_abs_err_gather_sorted: float | None
     max_abs_err_metal: float | None
     gather_ok: bool
+    hybrid_ba_ok: bool | None
     gather_sorted_ok: bool | None
     metal_ok: bool | None
 
@@ -169,6 +173,14 @@ def _gather_mixed_delta(x, a, b, scales, slot_rows):
     return scales[slot_rows].reshape((-1, 1)) * y
 
 
+def _hybrid_ba_mixed_delta(x, a, b, scales, slot_rows):
+    x3 = mx.expand_dims(x, -2)
+    z = mx.gather_mm(x3, a, rhs_indices=slot_rows, sorted_indices=False)
+    gathered_b = b[slot_rows]
+    y = mx.matmul(z, gathered_b).squeeze(-2)
+    return scales[slot_rows].reshape((-1, 1)) * y
+
+
 def _gather_mixed_sorted_delta(x, a, b, scales, slot_rows):
     order = mx.argsort(slot_rows)
     inv_order = mx.argsort(order)
@@ -248,15 +260,19 @@ def _run_case(
             dtype=dtype_name,
             ref_ms=_bench(lambda: _reference_delta(x, a, b, scale), warmup, iters),
             gather_ms=_bench(lambda: _gather_delta(x, a, b, scale), warmup, iters),
+            hybrid_ba_ms=None,
             gather_sorted_ms=None,
             metal_ms=_bench(lambda: _metal_delta(kernel, x, a, b, scale), warmup, iters),
             gather_speedup=None,
+            hybrid_ba_speedup=None,
             gather_sorted_speedup=None,
             metal_speedup=None,
             max_abs_err_gather=_max_abs_err(ref, gather),
+            max_abs_err_hybrid_ba=None,
             max_abs_err_gather_sorted=None,
             max_abs_err_metal=_max_abs_err(ref, metal),
             gather_ok=bool(mx.allclose(ref.astype(mx.float32), gather.astype(mx.float32), atol=5e-2, rtol=5e-2).item()),
+            hybrid_ba_ok=None,
             gather_sorted_ok=None,
             metal_ok=bool(mx.allclose(ref.astype(mx.float32), metal.astype(mx.float32), atol=5e-2, rtol=5e-2).item()),
         )
@@ -283,10 +299,16 @@ def _run_case(
 
     ref = _sync(_reference_mixed_delta(x, a, b, scales, slot_rows))
     gather = _sync(_gather_mixed_delta(x, a, b, scales, slot_rows))
+    hybrid_ba = _sync(_hybrid_ba_mixed_delta(x, a, b, scales, slot_rows))
     gather_sorted = _sync(_gather_mixed_sorted_delta(x, a, b, scales, slot_rows))
 
     ref_ms = _bench(lambda: _reference_mixed_delta(x, a, b, scales, slot_rows), warmup, iters)
     gather_ms = _bench(lambda: _gather_mixed_delta(x, a, b, scales, slot_rows), warmup, iters)
+    hybrid_ba_ms = _bench(
+        lambda: _hybrid_ba_mixed_delta(x, a, b, scales, slot_rows),
+        warmup,
+        iters,
+    )
     gather_sorted_ms = _bench(
         lambda: _gather_mixed_sorted_delta(x, a, b, scales, slot_rows),
         warmup,
@@ -300,15 +322,21 @@ def _run_case(
         dtype=dtype_name,
         ref_ms=ref_ms,
         gather_ms=gather_ms,
+        hybrid_ba_ms=hybrid_ba_ms,
         gather_sorted_ms=gather_sorted_ms,
         metal_ms=None,
         gather_speedup=(ref_ms / gather_ms) if gather_ms > 0 else math.inf,
+        hybrid_ba_speedup=(ref_ms / hybrid_ba_ms) if hybrid_ba_ms > 0 else math.inf,
         gather_sorted_speedup=(ref_ms / gather_sorted_ms) if gather_sorted_ms > 0 else math.inf,
         metal_speedup=None,
         max_abs_err_gather=_max_abs_err(ref, gather),
+        max_abs_err_hybrid_ba=_max_abs_err(ref, hybrid_ba),
         max_abs_err_gather_sorted=_max_abs_err(ref, gather_sorted),
         max_abs_err_metal=None,
         gather_ok=bool(mx.allclose(ref.astype(mx.float32), gather.astype(mx.float32), atol=5e-2, rtol=5e-2).item()),
+        hybrid_ba_ok=bool(
+            mx.allclose(ref.astype(mx.float32), hybrid_ba.astype(mx.float32), atol=5e-2, rtol=5e-2).item()
+        ),
         gather_sorted_ok=bool(
             mx.allclose(ref.astype(mx.float32), gather_sorted.astype(mx.float32), atol=5e-2, rtol=5e-2).item()
         ),
@@ -318,23 +346,27 @@ def _run_case(
 
 def _print_results(results: list[Result]) -> None:
     print(
-        f"{'mode':<12} {'case':<18} {'T':>3} {'dtype':>8} {'ref_ms':>9} {'gather_ms':>10} {'g_sorted':>10} {'metal_ms':>10} {'gx':>7} {'gsx':>7} {'mx':>7} {'g_err':>10} {'gs_err':>10} {'m_err':>10} {'g_ok':>5} {'gs_ok':>5} {'m_ok':>5}"
+        f"{'mode':<12} {'case':<18} {'T':>3} {'dtype':>8} {'ref_ms':>9} {'gather_ms':>10} {'hybrid_ba':>10} {'g_sorted':>10} {'metal_ms':>10} {'gx':>7} {'hbax':>7} {'gsx':>7} {'mx':>7} {'g_err':>10} {'hba_err':>10} {'gs_err':>10} {'m_err':>10} {'g_ok':>5} {'hba_ok':>6} {'gs_ok':>5} {'m_ok':>5}"
     )
-    print("-" * 196)
+    print("-" * 237)
     for row in results:
         print(
             f"{row.mode:<12} {row.case:<18} {row.tokens:>3} {row.dtype:>8} "
             f"{row.ref_ms:>9.4f} "
             f"{(row.gather_ms if row.gather_ms is not None else float('nan')):>10.4f} "
+            f"{(row.hybrid_ba_ms if row.hybrid_ba_ms is not None else float('nan')):>10.4f} "
             f"{(row.gather_sorted_ms if row.gather_sorted_ms is not None else float('nan')):>10.4f} "
             f"{(row.metal_ms if row.metal_ms is not None else float('nan')):>10.4f} "
             f"{(row.gather_speedup if row.gather_speedup is not None else row.ref_ms / row.gather_ms):>7.3f} "
+            f"{(row.hybrid_ba_speedup if row.hybrid_ba_speedup is not None else float('nan')):>7.3f} "
             f"{(row.gather_sorted_speedup if row.gather_sorted_speedup is not None else float('nan')):>7.3f} "
             f"{(row.metal_speedup if row.metal_speedup is not None else (row.ref_ms / row.metal_ms if row.metal_ms else float('nan'))):>7.3f} "
             f"{row.max_abs_err_gather:>10.5f} "
+            f"{(row.max_abs_err_hybrid_ba if row.max_abs_err_hybrid_ba is not None else float('nan')):>10.5f} "
             f"{(row.max_abs_err_gather_sorted if row.max_abs_err_gather_sorted is not None else float('nan')):>10.5f} "
             f"{(row.max_abs_err_metal if row.max_abs_err_metal is not None else float('nan')):>10.5f} "
             f"{str(row.gather_ok):>5} "
+            f"{str(row.hybrid_ba_ok if row.hybrid_ba_ok is not None else ''):>6} "
             f"{str(row.gather_sorted_ok if row.gather_sorted_ok is not None else ''):>5} "
             f"{str(row.metal_ok if row.metal_ok is not None else ''):>5}"
         )
@@ -369,6 +401,8 @@ def main() -> int:
     for row in results:
         if row.gather_ms is not None:
             row.gather_speedup = (row.ref_ms / row.gather_ms) if row.gather_ms > 0 else math.inf
+        if row.hybrid_ba_ms is not None:
+            row.hybrid_ba_speedup = (row.ref_ms / row.hybrid_ba_ms) if row.hybrid_ba_ms > 0 else math.inf
         if row.gather_sorted_ms is not None:
             row.gather_sorted_speedup = (row.ref_ms / row.gather_sorted_ms) if row.gather_sorted_ms > 0 else math.inf
         if row.metal_ms is not None:

@@ -417,3 +417,164 @@ This did not improve the real server path in a reliable way. It was neutral to w
 Decision:
 - do not keep that variant
 - keep the simpler `gather-mm` backend until a stronger compute-path change proves itself
+
+## Rejected backend candidate: hybrid-ba
+
+Another routed backend was tested after the first live mixed decode prototype:
+- keep the current unsorted `gather_mm` first pass for `A`
+- replace the second routed `gather_mm` with a dense batched matmul against row-gathered `B`
+
+This looked plausible in the isolated op lab:
+- it stayed numerically correct
+- on some attention-shaped decode cases it matched or slightly beat `gather-mm`
+
+But the live runtime comparison on the same `mixed decode migration` profile did not justify keeping it as a supported backend.
+
+Profile compared:
+- `--routed-decode-backend gather-mm`
+- `--enable-mixed-decode-migration`
+- `--max-batch-size 128`
+- `--prefill-batch-size 32`
+
+Live result against `gather-mm` on the same server benchmark battery:
+- `same @64`
+  - small improvement (`31.5 -> 31.8 req/s`)
+- `mixed @64`
+  - worse (`23.7 -> 22.8 req/s`)
+- `long-decode-mixed @64`
+  - worse (`15.6 -> 15.2 req/s`)
+- `fairness @64`
+  - slightly worse (`25.5 -> 25.4 req/s`)
+- `same @128`
+  - worse (`31.7 -> 31.1 req/s`)
+- `mixed @128`
+  - worse (`22.9 -> 22.3 req/s`)
+- `long-decode-mixed @128`
+  - worse (`16.7 -> 16.5 req/s`)
+- `fairness @128`
+  - worse (`24.0 -> 23.3 req/s`)
+
+[Inference]
+The isolated op win was too narrow. Once it paid the real runtime costs around migration, grouping, and the rest of the decode path, it did not beat the existing `gather-mm` backend.
+
+Decision:
+- do not keep `hybrid-ba` as a routed decode backend
+- keep it only as a lab result
+- continue from `gather-mm` for the live runtime until a stronger compute-path change proves itself
+
+## New experimental backend: metal-gather
+
+The next useful step was not another MLX-level backend variant.
+It was a narrower compute-path change:
+- keep the same live routed runtime
+- keep `gather-mm` as the baseline routed backend
+- add a new backend that uses a custom Metal kernel only on the layer families where the isolated kernel lab already beats `gather-mm`
+- fall back to `gather-mm` for the rest
+
+The first useful kernel shape was not the naive one-thread-per-output kernel.
+That version stayed too slow because it still underused the threadgroup and effectively paid too much work per row.
+
+The better candidate was a 2D reduction kernel:
+- `threadgroup.x` splits the `D` dimension reduction
+- `threadgroup.y` maps the LoRA rank lanes
+- the threadgroup cooperatively computes `z = x[row] @ A[slot]`
+- only `lane_y == 0` writes the output columns
+
+[Inference]
+This is the first routed Metal design that actually attacks the right bottleneck:
+- parallelize the `D` reduction
+- then reuse the reduced `z` across the whole output row
+
+### Isolated kernel-lab result
+
+With the 2D reduction kernel at `T=32`, `float16`, routed mixed rows:
+
+- `attn_q_proj`
+  - `gather-mm`: `0.1907 ms`
+  - metal reduce: `0.1660-0.1751 ms` depending on pattern
+- `attn_kv_proj`
+  - `gather-mm`: `0.1841-0.1907 ms`
+  - metal reduce: `0.1606-0.1724 ms`
+- `mlp_down_proj`
+  - `gather-mm`: `0.2104-0.2205 ms`
+  - metal reduce: `0.1770-0.1865 ms`
+- `mlp_up_gate_proj`
+  - `gather-mm`: still better
+  - metal reduce: `0.2222-0.2571 ms` vs `0.1770-0.2195 ms`
+
+Decision from the lab:
+- use Metal only for:
+  - `q_proj`
+  - `k_proj`
+  - `v_proj`
+  - `o_proj`
+  - `down_proj`
+- keep `gather-mm` for:
+  - `up_proj`
+  - `gate_proj`
+
+Implementation detail:
+- `q_proj` / `o_proj`: `threads_x = 96`
+- `k_proj` / `v_proj` / `down_proj`: `threads_x = 128`
+- `up_proj` / `gate_proj`: no Metal path
+
+### Live result at `128`, `repeats=2`
+
+Compared against `gather-mm` on the same runtime profile:
+- `--enable-mixed-decode-migration`
+- `--max-batch-size 128`
+- `--prefill-batch-size 32`
+
+`metal-gather` tuned vs `gather-mm`:
+
+- `same`
+  - `32.2 -> 31.7 req/s`
+  - `1915.6 -> 1911.8 tok/s`
+  - `3910.5 -> 3992.4 ms p95`
+- `mixed`
+  - `23.2 -> 23.6 req/s`
+  - `1147.3 -> 1129.6 tok/s`
+  - `5323.0 -> 5228.8 ms p95`
+- `long-decode-mixed`
+  - `16.0 -> 16.8 req/s`
+  - `1487.4 -> 1558.0 tok/s`
+  - `7720.7 -> 7369.9 ms p95`
+- `fairness`
+  - `24.2 -> 24.3 req/s`
+  - `1241.9 -> 1246.6 tok/s`
+  - `5108.6 -> 5062.5 ms p95`
+
+[Inference]
+At `conc=128`, this backend is not a universal win.
+But it is the first routed compute backend that improves the key mixed decode shape without collapsing the rest of the runtime.
+
+### Live result at `256`, `repeats=1`
+
+Compared against `gather-mm` on the same profile:
+
+- `same`
+  - `32.8 -> 33.5 req/s`
+  - `1959.2 -> 2013.1 tok/s`
+  - `7787.0 -> 7618.9 ms p95`
+- `mixed`
+  - `23.2 -> 23.4 req/s`
+  - `1127.9 -> 1153.4 tok/s`
+  - `10717.3 -> 10643.9 ms p95`
+- `long-decode-mixed`
+  - `15.2 -> 15.5 req/s`
+  - `1441.9 -> 1448.6 tok/s`
+  - `16383.8 -> 16167.8 ms p95`
+- `fairness`
+  - `22.9 -> 23.7 req/s`
+  - `1193.7 -> 1202.0 tok/s`
+  - `10832.5 -> 10520.3 ms p95`
+
+[Inference]
+The advantage becomes clearer as the shared mixed decode batches get larger.
+This backend is now best understood as a higher-load experimental path, not as a replacement for the default routed backend at every traffic level.
+
+Decision:
+- keep `metal-gather` as an experimental routed backend
+- do not make it the default
+- keep `gather-mm` as the simpler experimental baseline
+- continue future compute work from this backend, not from the older naive `metal-kernel`
