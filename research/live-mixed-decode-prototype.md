@@ -188,6 +188,20 @@ Representative `repeats=1` live run:
   - `mixed_rows=1357`
   - `avg_rows=9.69`
 
+- `mixed @32`
+  - `migration_events=10`
+  - `migrated_sequences=32`
+  - `mixed_steps=75`
+  - `mixed_rows=1520`
+  - `avg_rows=20.27`
+
+- `long-decode-mixed @32`
+  - `migration_events=9`
+  - `migrated_sequences=32`
+  - `mixed_steps=139`
+  - `mixed_rows=2804`
+  - `avg_rows=20.17`
+
 [Inference]
 This is a useful threshold result.
 The current runtime is no longer “barely exercising” the mixed shared path:
@@ -197,6 +211,74 @@ The current runtime is no longer “barely exercising” the mixed shared path:
 
 [Inference]
 That makes the next likely ceiling more about the routed compute backend than about a low migration rate.
+
+## Upstream MLX signal on sorting
+
+Reading upstream MLX / MLX-LM clarified when sorted routed matmul is expected to help:
+
+- MLX’s `gather_mm` fast path for `sorted_indices=True` is only meaningful in the one-sided indexed case
+- MLX-LM’s routed expert layers explicitly sort/unsort rows around expert matmuls
+- upstream only enables that sorted path when the grouped routed batch is already large enough
+- in `mlx_lm.models.switch_layers`, the explicit sorting threshold is `indices.size >= 64`
+
+[Inference]
+That makes sorted routed execution a poor fit for the current MOLA prototype:
+- the live shared mixed slot already helps without sorting
+- current average mixed decode row counts are around `5` to `20`, not `64+`
+- MOLA’s present routed LoRA path would have to pay extra sort/unsort work before it could even reach the upstream fast path shape
+
+Decision:
+- do not pursue sorted routed decode in the current runtime
+- keep `gather-mm` unsorted as the meaningful non-kernel backend
+- if sorted routing is revisited later, it should be paired with a runtime that can actually feed much larger grouped batches
+
+## Batch-size knob result
+
+The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
+
+The useful experiment was:
+- keep the same `gather-mm + migration` runtime
+- compare `max_batch_size=32` vs `max_batch_size=64`
+
+### High concurrency (`conc=64`)
+
+`max_batch_size=64` is clearly better than `32`:
+
+- `same`
+  - `21.9 -> 27.2 req/s`
+  - `1258.3 -> 1648.8 tok/s`
+  - `2910.0 -> 2348.8 ms p95`
+
+- `mixed`
+  - `22.8 -> 23.6 req/s`
+  - `1201.4 -> 1150.4 tok/s`
+  - `2783.8 -> 2695.8 ms p95`
+
+- `long-decode-mixed`
+  - `15.4 -> 15.2 req/s`
+  - `1416.1 -> 1493.3 tok/s`
+  - `4142.9 -> 4206.4 ms p95`
+
+- `fairness`
+  - `23.3 -> 23.5 req/s`
+  - `1211.1 -> 1226.2 tok/s`
+  - `2723.0 -> 2698.7 ms p95`
+
+### Lower concurrency (`conc=8/16`)
+
+`max_batch_size=64` does not look like a new default:
+- generally neutral to slightly worse on `req/s` and `p95`
+- sometimes better on `tok/s`
+- not a consistent win at lower concurrency
+
+[Inference]
+This makes `max_batch_size` a real deployment knob, not yet a new global default:
+- at higher concurrency it materially helps
+- at lower concurrency it is not reliably better
+
+Decision:
+- keep the knob exposed
+- do not change the default from `32` yet
 
 ## What this means
 
@@ -228,3 +310,17 @@ The important architectural result is:
 
 3. prototype narrower failure handling for the shared mixed slot
 - isolate a bad migrated row without killing the whole shared decode batch if practical
+
+## Rejected experiment
+
+One backend tweak looked attractive on paper and did not pay off live:
+- precompute `rhs_indices`
+- pre-scale `lora_b` by the adapter scale
+- remove the final gathered-scale multiply in `gather-mm`
+
+[Inference]
+This did not improve the real server path in a reliable way. It was neutral to worse on the mixed cases and clearly worse on `same` / `fairness` in repeated live runs.
+
+Decision:
+- do not keep that variant
+- keep the simpler `gather-mm` backend until a stronger compute-path change proves itself

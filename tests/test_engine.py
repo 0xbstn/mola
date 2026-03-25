@@ -71,6 +71,8 @@ class TestEngineMetrics:
         assert snap["queued_requests"] == 0
         assert snap["total_step_lock_wait_ms"] == 0
         assert snap["total_insert_lock_wait_ms"] == 0
+        assert snap["completion_batch_size_limit"] == 0
+        assert snap["prefill_batch_size_limit"] == 0
         assert snap["avg_ttft_ms"] == 0
         assert snap["avg_tps"] == 0
         assert snap["routed_decode_backend"] == "reference"
@@ -106,6 +108,8 @@ class TestEngineMetrics:
         assert snap["requests_rejected"] == 0
         assert snap["inflight_tokens_reserved"] == 0
         assert snap["token_budget_limit"] == 32768
+        assert snap["completion_batch_size_limit"] == 0
+        assert snap["prefill_batch_size_limit"] == 0
         assert snap["total_step_lock_wait_ms"] == 0
         assert snap["total_insert_lock_wait_ms"] == 0
         assert snap["routed_decode_reference_enabled"] is False
@@ -146,6 +150,14 @@ class TestEngineMetrics:
             config=EngineConfig(routed_decode_backend="metal-kernel")
         )
         assert engine.metrics.snapshot()["routed_decode_backend"] == "metal-kernel"
+
+    def test_engine_config_marks_batch_limits_in_metrics(self):
+        engine = _make_engine(
+            config=EngineConfig(max_batch_size=64, prefill_batch_size=12)
+        )
+        snap = engine.metrics.snapshot()
+        assert snap["completion_batch_size_limit"] == 64
+        assert snap["prefill_batch_size_limit"] == 12
 
     def test_engine_config_marks_gather_mm_routed_decode_backend_in_metrics(self):
         engine = _make_engine(

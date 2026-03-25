@@ -80,6 +80,8 @@ class ScenarioResult:
     engine_tok_s: float
     engine_step_lock_wait_ms: float
     engine_insert_lock_wait_ms: float
+    engine_completion_batch_size_limit: int
+    engine_prefill_batch_size_limit: int
     engine_routed_decode_reference_enabled: bool
     engine_routed_decode_reference_strict: bool
     engine_routed_decode_backend: str
@@ -345,6 +347,12 @@ async def _run_scenario(
         engine_tok_s=(token_delta / wall_s) if wall_s > 0 else 0.0,
         engine_step_lock_wait_ms=step_lock_wait_delta,
         engine_insert_lock_wait_ms=insert_lock_wait_delta,
+        engine_completion_batch_size_limit=int(
+            after.get("completion_batch_size_limit", 0)
+        ),
+        engine_prefill_batch_size_limit=int(
+            after.get("prefill_batch_size_limit", 0)
+        ),
         engine_routed_decode_reference_enabled=bool(
             after.get("routed_decode_reference_enabled", False)
         ),

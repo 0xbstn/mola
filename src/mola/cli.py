@@ -41,6 +41,20 @@ def main(verbose: bool):
     help="Global in-flight token budget for admission control",
 )
 @click.option(
+    "--max-batch-size",
+    default=32,
+    show_default=True,
+    type=int,
+    help="Maximum active completion rows per generator",
+)
+@click.option(
+    "--prefill-batch-size",
+    default=8,
+    show_default=True,
+    type=int,
+    help="Maximum prompt insertions per prefill wave",
+)
+@click.option(
     "--enable-routed-decode-reference",
     is_flag=True,
     help="Enable the experimental homogeneous routed-decode reference path",
@@ -68,6 +82,8 @@ def serve(
     host: str,
     port: int,
     max_inflight_tokens: int,
+    max_batch_size: int,
+    prefill_batch_size: int,
     enable_routed_decode_reference: bool,
     strict_routed_decode_reference: bool,
     routed_decode_backend: str,
@@ -89,6 +105,8 @@ def serve(
         mola_model,
         EngineConfig(
             max_inflight_tokens=max_inflight_tokens,
+            max_batch_size=max_batch_size,
+            prefill_batch_size=prefill_batch_size,
             enable_routed_decode_reference=enable_routed_decode_reference,
             strict_routed_decode_reference=strict_routed_decode_reference,
             routed_decode_backend=routed_decode_backend,
@@ -99,6 +117,8 @@ def serve(
     click.echo(f"MOLA serving on http://{host}:{port}")
     click.echo(f"  Base model: {model}")
     click.echo(f"  Adapters: {[name for name, _ in adapter] or ['none']}")
+    click.echo(f"  Completion batch size: {max_batch_size}")
+    click.echo(f"  Prefill batch size: {prefill_batch_size}")
     click.echo(f"  Routed decode reference: {'on' if enable_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode strict: {'on' if strict_routed_decode_reference else 'off'}")
     click.echo(f"  Routed decode backend: {routed_decode_backend}")

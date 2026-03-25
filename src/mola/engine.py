@@ -123,6 +123,8 @@ class EngineMetrics:
     requests_rejected: int = 0
     inflight_tokens_reserved: int = 0
     token_budget_limit: int = 0
+    completion_batch_size_limit: int = 0
+    prefill_batch_size_limit: int = 0
     total_step_lock_wait_ms: float = 0.0
     total_insert_lock_wait_ms: float = 0.0
     routed_decode_reference_enabled: bool = False
@@ -154,6 +156,8 @@ class EngineMetrics:
             "requests_rejected": self.requests_rejected,
             "inflight_tokens_reserved": self.inflight_tokens_reserved,
             "token_budget_limit": self.token_budget_limit,
+            "completion_batch_size_limit": self.completion_batch_size_limit,
+            "prefill_batch_size_limit": self.prefill_batch_size_limit,
             "total_step_lock_wait_ms": round(self.total_step_lock_wait_ms, 2),
             "total_insert_lock_wait_ms": round(self.total_insert_lock_wait_ms, 2),
             "routed_decode_reference_enabled": self.routed_decode_reference_enabled,
@@ -233,6 +237,8 @@ class MOLAEngine:
         self.config = config or EngineConfig()
         self.metrics = EngineMetrics()
         self.metrics.token_budget_limit = self.config.max_inflight_tokens
+        self.metrics.completion_batch_size_limit = self.config.max_batch_size
+        self.metrics.prefill_batch_size_limit = self.config.prefill_batch_size
         self.metrics.routed_decode_reference_enabled = (
             self.config.enable_routed_decode_reference
         )
