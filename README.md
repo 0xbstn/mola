@@ -18,6 +18,11 @@ MOLA serves multiple LoRA adapters from one MLX base model on Apple Silicon. The
 
 > **Status:** Alpha. The published benchmark below uses `mlx-community/Qwen2.5-0.5B-Instruct-4bit` with 8 resident adapters on Apple Silicon and `mlx-lm 0.31.1`.
 
+| Approach | Runtime shape |
+|---|---|
+| Separate fine-tuned models | one full model per specialty, higher memory, reloads when switching |
+| MOLA | one base model plus many LoRA adapters, lower memory, no model reloads |
+
 ## What MOLA Does
 
 - Serve one base model with many LoRA adapters loaded at the same time
@@ -43,7 +48,11 @@ python3 -m venv .venv
 Start the recommended runtime profile:
 
 ```bash
-./.venv/bin/python devtools/run_mola_current_architecture.py start --port 8000
+./.venv/bin/python devtools/run_mola_current_architecture.py start \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --adapter rust ./path/to/rust-adapter \
+  --adapter sql ./path/to/sql-adapter \
+  --port 8000
 ```
 
 Equivalent explicit command:
@@ -51,14 +60,9 @@ Equivalent explicit command:
 ```bash
 ./.venv/bin/python -m mola.cli -v serve \
   --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
-  --adapter rust ./adapters/rust-lora \
-  --adapter sql ./adapters/sql-lora \
-  --adapter medical ./adapters/medical-lora \
-  --adapter cyber ./adapters/cyber-lora \
-  --adapter solidity ./adapters/solidity-lora \
-  --adapter devops ./adapters/devops-lora \
-  --adapter math ./adapters/math-lora \
-  --adapter legal ./adapters/legal-lora \
+  --adapter rust ./path/to/rust-adapter \
+  --adapter sql ./path/to/sql-adapter \
+  --adapter support ./path/to/support-adapter \
   --max-inflight-tokens 131072 \
   --max-batch-size 128 \
   --prefill-batch-size 32 \
@@ -100,7 +104,7 @@ curl http://localhost:8000/v1/adapters
 
 curl -X POST http://localhost:8000/v1/adapters \
   -H "Content-Type: application/json" \
-  -d '{"name": "medical", "path": "./adapters/medical-lora"}'
+  -d '{"name": "medical", "path": "./path/to/medical-adapter"}'
 
 curl -X DELETE http://localhost:8000/v1/adapters/medical
 ```
@@ -122,28 +126,28 @@ Reproduce the published benchmark with:
 ```bash
 ./.venv/bin/python scripts/bench_server.py \
   --routed-validation \
-  --concurrency 64,128 \
+  --concurrency 1,64,128 \
   --repeats 3 \
   --json-out /tmp/mola-current-architecture-bench.json
 ```
 
 Published profile:
 - model: `mlx-community/Qwen2.5-0.5B-Instruct-4bit`
-- adapters: `rust`, `sql`, `medical`, `cyber`, `solidity`, `devops`, `math`, `legal`
+- adapters: 8 resident adapters
 - backend: `metal-gather`
 - batch sizes: `128 / 32`
 
-| Scenario | conc=64 | conc=128 |
-|---|---|---|
-| Same | 33.6 req/s, 1984.8 tok/s, p95 1927.3 ms | 31.9 req/s, 1937.4 tok/s, p95 3957.6 ms |
-| Mixed | 27.8 req/s, 1351.4 tok/s, p95 2284.9 ms | 26.7 req/s, 1311.5 tok/s, p95 4614.4 ms |
-| Long decode mixed | 12.2 req/s, 1752.8 tok/s, p95 5290.1 ms | 13.4 req/s, 1996.5 tok/s, p95 9425.9 ms |
-| Hot/cold skew mix | 29.7 req/s, 1533.4 tok/s, p95 2184.8 ms | 28.4 req/s, 1472.7 tok/s, p95 4346.7 ms |
+| Scenario | conc=1 | conc=64 | conc=128 |
+|---|---|---|---|
+| Same | 3.3 req/s, 201.6 tok/s, p95 317.0 ms | 33.3 req/s, 2020.5 tok/s, p95 1965.5 ms | 32.4 req/s, 1954.4 tok/s, p95 3898.3 ms |
+| Mixed | 3.2 req/s, 203.8 tok/s, p95 315.9 ms | 28.1 req/s, 1389.9 tok/s, p95 2260.7 ms | 27.5 req/s, 1354.3 tok/s, p95 4499.5 ms |
+| Long decode mixed | 1.3 req/s, 209.2 tok/s, p95 895.5 ms | 12.0 req/s, 1777.2 tok/s, p95 5271.4 ms | 13.7 req/s, 1931.1 tok/s, p95 9182.2 ms |
+| Hot/cold skew mix | 3.5 req/s, 203.2 tok/s, p95 313.4 ms | 30.0 req/s, 1525.7 tok/s, p95 2141.9 ms | 28.5 req/s, 1457.8 tok/s, p95 4326.9 ms |
 
 Key ratios:
 
 - `mixed / same @64` ≈ `0.83`
-- `mixed / same @128` ≈ `0.84`
+- `mixed / same @128` ≈ `0.85`
 
 ## Adapter Format
 

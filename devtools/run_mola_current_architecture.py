@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv" / "bin" / "python"
 PATCHER = ROOT / "devtools" / "apply_mlx_lm_detached_batch_api.py"
 DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-DEFAULT_ADAPTERS = [
+LOCAL_BENCHMARK_ADAPTERS = [
     ("rust", ROOT / "adapters" / "rust-lora"),
     ("sql", ROOT / "adapters" / "sql-lora"),
     ("medical", ROOT / "adapters" / "medical-lora"),
@@ -108,6 +108,32 @@ def apply_patch_if_needed() -> int:
     return 0
 
 
+def resolve_adapters(
+    args: argparse.Namespace,
+) -> list[tuple[str, Path]]:
+    adapters = [
+        (name, Path(path))
+        for name, path in (args.adapter or [])
+    ]
+    if args.use_local_benchmark_adapters:
+        adapters.extend(LOCAL_BENCHMARK_ADAPTERS)
+    if not adapters:
+        raise ValueError(
+            "No adapters configured. Pass one or more '--adapter NAME PATH' pairs, "
+            "or use '--use-local-benchmark-adapters' for the local benchmark profile."
+        )
+    return adapters
+
+
+def validate_adapter_config(args: argparse.Namespace) -> int | None:
+    try:
+        resolve_adapters(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return None
+
+
 def build_command(args: argparse.Namespace) -> tuple[list[str], Path]:
     log_path = (
         Path(args.log)
@@ -139,7 +165,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], Path]:
         "--cache-routed-decode-sessions",
         "--detached-shared-decode-owner",
     ]
-    for name, path in DEFAULT_ADAPTERS:
+    for name, path in resolve_adapters(args):
         cmd.extend(["--adapter", name, str(path)])
     return cmd, log_path
 
@@ -151,7 +177,11 @@ def start_server(args: argparse.Namespace) -> int:
     if pid_list(args.port):
         print(f"Server already running on port {args.port}: {pid_list(args.port)}", file=sys.stderr)
         return 1
-    cmd, log_path = build_command(args)
+    try:
+        cmd, log_path = build_command(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     with log_path.open("wb") as log_file:
         proc = subprocess.Popen(
             cmd,
@@ -206,24 +236,60 @@ def logs(path: str | None, port: int) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Start or manage the recommended public MOLA runtime profile.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("action", choices=["start", "stop", "restart", "status", "logs"])
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--log", default=None)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--max-inflight-tokens", type=int, default=131072)
-    parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--prefill-batch-size", type=int, default=32)
+    parser.add_argument("--port", type=int, default=8000, help="Server port")
+    parser.add_argument("--log", default=None, help="Optional log file path")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Base model path or Hugging Face ID")
+    parser.add_argument(
+        "--adapter",
+        action="append",
+        nargs=2,
+        metavar=("NAME", "PATH"),
+        help="Adapter name and path. Repeat for multiple adapters.",
+    )
+    parser.add_argument(
+        "--use-local-benchmark-adapters",
+        action="store_true",
+        help="Opt in to the maintainer's local benchmark adapter set.",
+    )
+    parser.add_argument(
+        "--max-inflight-tokens",
+        type=int,
+        default=131072,
+        help="Global inflight token budget",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=128,
+        help="Decode batch size",
+    )
+    parser.add_argument(
+        "--prefill-batch-size",
+        type=int,
+        default=32,
+        help="Prefill batch size",
+    )
     return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     if args.action == "start":
+        validation_error = validate_adapter_config(args)
+        if validation_error is not None:
+            return validation_error
         return start_server(args)
     if args.action == "stop":
         return stop_server(args.port)
     if args.action == "restart":
+        validation_error = validate_adapter_config(args)
+        if validation_error is not None:
+            return validation_error
         rc = stop_server(args.port)
         if rc != 0 and pid_list(args.port):
             return rc
