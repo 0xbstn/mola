@@ -240,6 +240,25 @@ One extra runtime check made this even clearer:
 So today this is not just a “not worth it yet” path.
 For MOLA’s routed LoRA delta shape on this stack, it is currently not a trustworthy backend candidate.
 
+## Rejected backend candidate: indexed batched matmul
+
+Another candidate was tested in the lab:
+- gather `A` and `B` by routed row index
+- then run a regular batched matmul
+
+The isolated microbench looked plausible on some shapes, so it was wired as a real backend candidate.
+
+Live result:
+- it booted
+- but it did not survive a real routed validation run cleanly enough to treat as a stable candidate
+
+Decision:
+- drop the backend from the repo
+- keep only the conclusion
+
+[Inference]
+For now, `gather-mm` remains the only routed non-kernel backend worth carrying in the live code path.
+
 ## Batch-size knob result
 
 The current runtime can now expose `max_batch_size` and `prefill_batch_size` directly from the CLI.
