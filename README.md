@@ -40,7 +40,7 @@ This is the practical tradeoff MOLA is built for: keep one base model resident, 
 ### Install
 
 ```bash
-git clone https://github.com/0xbstn/mola.git
+git clone https://github.com/bstnxbt/mola.git
 cd mola
 python3 -m venv .venv
 ./.venv/bin/python -m ensurepip --upgrade
